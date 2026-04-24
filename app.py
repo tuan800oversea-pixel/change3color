@@ -15,6 +15,7 @@ from typing import Any
 import cv2
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 from skimage import color
 
 
@@ -2259,6 +2260,881 @@ def build_single_job_ui() -> None:
                             "same_color_pairs": {name: round(float(value), 3) for name, value in combo.get("harmony_pairs", {}).items()},
                         }
                     )
+
+
+def cleanup_dark_flat_noise(result_bgr: np.ndarray, flat_mask: np.ndarray, structure_mask: np.ndarray, dark_strength: float) -> np.ndarray:
+    if dark_strength <= 0.04:
+        return result_bgr
+    lab = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l_channel = lab[:, :, 0].astype(np.uint8)
+    a_channel = lab[:, :, 1].astype(np.uint8)
+    b_channel = lab[:, :, 2].astype(np.uint8)
+    chroma_soft = cv2.GaussianBlur(cv2.merge([a_channel, b_channel]), (0, 0), 1.25 + 0.85 * dark_strength)
+    l_low = cv2.resize(l_channel, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    l_low = cv2.GaussianBlur(l_low, (0, 0), 1.1 + 1.2 * dark_strength)
+    l_smooth = cv2.resize(l_low, (l_channel.shape[1], l_channel.shape[0]), interpolation=cv2.INTER_CUBIC)
+    local_noise = cv2.absdiff(l_channel, cv2.GaussianBlur(l_channel, (0, 0), 1.0))
+    noise_boost = 0.0
+    noise_mask = flat_mask > 0.08
+    if np.any(noise_mask):
+        noise_level = float(np.percentile(local_noise[noise_mask], 82))
+        noise_boost = float(np.clip((noise_level - 2.4) / 7.5, 0.0, 1.0))
+    preserve = 1.0 - 0.35 * np.clip(structure_mask, 0.0, 1.0)
+    chroma_alpha = np.clip(flat_mask * (0.18 + 0.36 * dark_strength + 0.22 * noise_boost) * preserve, 0.0, 1.0)
+    l_alpha = np.clip(flat_mask * (0.10 + 0.24 * dark_strength + 0.20 * noise_boost) * preserve, 0.0, 1.0)
+    lab[:, :, 0] = lab[:, :, 0] * (1.0 - l_alpha) + l_smooth.astype(np.float32) * l_alpha
+    lab[:, :, 1] = lab[:, :, 1] * (1.0 - chroma_alpha) + chroma_soft[:, :, 0].astype(np.float32) * chroma_alpha
+    lab[:, :, 2] = lab[:, :, 2] * (1.0 - chroma_alpha) + chroma_soft[:, :, 1].astype(np.float32) * chroma_alpha
+    return cv2.cvtColor(np.clip(lab, 0.0, 255.0).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
+def render_standard(orig_img: np.ndarray, gray_img: np.ndarray, mask_3d: np.ndarray, target_lab: np.ndarray, params: tuple[float, float, float, float, float]) -> np.ndarray:
+    gamma, l_off, a_off, b_off, detail_boost = params
+    l_t, a_t, b_t = target_lab.astype(float)
+    pale_strength = pale_color_strength(target_lab)
+    dark_strength = dark_color_strength(target_lab)
+    white_strength = white_color_strength(target_lab)
+    denoise_d = 3 if dark_strength > 0.35 else (7 if pale_strength >= 0.2 else 5)
+    sigma_color = 16 + int(round(30 * pale_strength - 4 * dark_strength + 18 * white_strength))
+    sigma_space = 16 + int(round(22 * pale_strength - 4 * dark_strength + 16 * white_strength))
+    sigma_color = max(10, sigma_color)
+    sigma_space = max(10, sigma_space)
+    denoised_gray = cv2.bilateralFilter(gray_img, d=denoise_d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
+    blur_layer = cv2.GaussianBlur(denoised_gray, (15, 15), 0)
+    detail_gain = detail_boost * (1.0 - 0.60 * pale_strength - 0.24 * white_strength - 0.12 * dark_strength)
+    detail_layer = cv2.subtract(denoised_gray, blur_layer).astype(np.float32) * detail_gain
+    img_norm = denoised_gray.astype(np.float32) / 255.0
+    img_gamma = np.power(img_norm + 1e-7, 1.0 / max(gamma, 0.01))
+    mask_bool = mask_3d[:, :, 0] > 0.08
+    structure_mask = np.zeros_like(gray_img, dtype=np.float32)
+    if np.any(mask_bool):
+        detail_abs = np.abs(detail_layer[mask_bool])
+        detail_scale = float(np.percentile(detail_abs, 88)) + 1e-6
+        grad_x = cv2.Sobel(denoised_gray.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(denoised_gray.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = cv2.magnitude(grad_x, grad_y)
+        grad_scale = float(np.percentile(grad_mag[mask_bool], 88)) + 1e-6
+        structure_mask = np.clip((np.abs(detail_layer) / detail_scale) * 0.58 + (grad_mag / grad_scale) * 0.42, 0.0, 1.0)
+        structure_mask = cv2.GaussianBlur(structure_mask, (7, 7), 0)
+        if dark_strength > 0.02:
+            flat_guard = 1.0 - np.clip(structure_mask, 0.0, 1.0)
+            detail_layer *= 1.0 - (0.62 * dark_strength * flat_guard)
+    flat_mask = np.clip(mask_3d[:, :, 0] * (1.0 - np.clip(structure_mask, 0.0, 1.0)), 0.0, 1.0)
+    current_mean_l = float(np.mean(img_gamma[mask_bool])) if np.any(mask_bool) else 0.5
+    target_l = np.clip(l_t + l_off, 0, 255)
+    shift_l = (target_l / 255.0) - current_mean_l
+    shadow_map = np.clip((img_gamma + shift_l) * 255.0 + detail_layer, 0, 255.0)
+    if white_strength > 0.03:
+        highlight_map = np.clip((shadow_map - 118.0) / 110.0, 0.0, 1.0) * (1.0 - 0.55 * structure_mask)
+        shadow_map = np.clip(shadow_map + highlight_map * (7.0 + 12.0 * white_strength), 0.0, 255.0)
+    if pale_strength > 0.01:
+        shadow_u8 = shadow_map.astype(np.uint8)
+        smooth_shadow = cv2.bilateralFilter(
+            shadow_u8,
+            d=7,
+            sigmaColor=10 + int(round(18 * pale_strength + 22 * white_strength)),
+            sigmaSpace=14 + int(round(18 * pale_strength + 18 * white_strength)),
+        )
+        shadow_alpha = np.clip(mask_3d[:, :, 0] * (0.18 + 0.34 * pale_strength + 0.18 * white_strength), 0.0, 1.0)
+        shadow_alpha *= (1.0 - 0.78 * structure_mask)
+        shadow_map = blend_with_alpha(shadow_u8, smooth_shadow, shadow_alpha).astype(np.float32)
+    final_a = np.clip(a_t + a_off, 0, 255)
+    final_b = np.clip(b_t + b_off, 0, 255)
+    if white_strength > 0.02:
+        final_a = 128.0 + (final_a - 128.0) * (1.0 - 0.38 * white_strength)
+        final_b = 128.0 + (final_b - 128.0) * (1.0 - 0.38 * white_strength)
+    merged_lab = cv2.merge(
+        [
+            shadow_map.astype(np.uint8),
+            np.full_like(shadow_map, int(final_a), dtype=np.uint8),
+            np.full_like(shadow_map, int(final_b), dtype=np.uint8),
+        ]
+    )
+    result_bgr = cv2.cvtColor(merged_lab, cv2.COLOR_LAB2BGR)
+    if dark_strength > 0.05:
+        dark_bilateral = cv2.bilateralFilter(
+            result_bgr,
+            d=7,
+            sigmaColor=14 + int(round(26 * dark_strength)),
+            sigmaSpace=16 + int(round(24 * dark_strength)),
+        )
+        dark_median = cv2.medianBlur(result_bgr, 3)
+        dark_smooth = cv2.addWeighted(dark_bilateral, 0.68, dark_median, 0.32, 0)
+        dark_alpha = np.clip(flat_mask * (0.16 + 0.42 * dark_strength), 0.0, 1.0)
+        result_bgr = blend_with_alpha(result_bgr, dark_smooth, dark_alpha)
+        result_bgr = cleanup_dark_flat_noise(result_bgr, flat_mask, structure_mask, dark_strength)
+    if pale_strength > 0.01:
+        smooth_result = cv2.bilateralFilter(
+            result_bgr,
+            d=7,
+            sigmaColor=14 + int(round(24 * pale_strength + 24 * white_strength)),
+            sigmaSpace=16 + int(round(20 * pale_strength + 22 * white_strength)),
+        )
+        result_alpha = np.clip(mask_3d[:, :, 0] * (0.12 + 0.30 * pale_strength + 0.16 * white_strength), 0.0, 1.0)
+        result_alpha *= (1.0 - 0.80 * structure_mask)
+        result_bgr = blend_with_alpha(result_bgr, smooth_result, result_alpha)
+    if white_strength > 0.04:
+        result_lab = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        mask_alpha = np.clip(mask_3d[:, :, 0], 0.0, 1.0)
+        preserve = 1.0 - 0.86 * structure_mask
+        ab_alpha = mask_alpha * (0.18 + 0.28 * white_strength) * preserve
+        l_alpha = mask_alpha * (0.08 + 0.14 * white_strength) * preserve
+        result_lab[:, :, 0] = np.clip(result_lab[:, :, 0] + l_alpha * (6.0 + 10.0 * white_strength), 0.0, 255.0)
+        result_lab[:, :, 1] = result_lab[:, :, 1] * (1.0 - ab_alpha) + final_a * ab_alpha
+        result_lab[:, :, 2] = result_lab[:, :, 2] * (1.0 - ab_alpha) + final_b * ab_alpha
+        result_bgr = cv2.cvtColor(result_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    final_f = (result_bgr.astype(np.float32) / 255.0) * mask_3d + (orig_img.astype(np.float32) / 255.0) * (1.0 - mask_3d)
+    return (np.clip(final_f, 0, 1) * 255.0).astype(np.uint8)
+
+
+def discover_sample_bundle(sample_name: str) -> dict[str, Any]:
+    folder = APP_DIR / sample_name
+    if sample_name == "D":
+        orig_path = folder / "11_1776997505.jpg"
+        mask_path = folder / "11(14).png"
+        if not orig_path.exists() or not mask_path.exists():
+            raise FileNotFoundError(f"Sample folder not found: {folder}")
+        return {
+            "label": sample_name,
+            "region_count": 1,
+            "orig_img": read_image_path(orig_path),
+            "region_sources": [{"name": "主体", "mask_source": read_image_path(mask_path)}],
+        }
+    folder = APP_DIR / sample_name
+    if not folder.exists() or not folder.is_dir():
+        raise FileNotFoundError(f"Sample folder not found: {folder}")
+    files = sorted([path for path in folder.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES])
+    if not files:
+        raise FileNotFoundError(f"No image files found in sample folder: {folder}")
+    if sample_name in {"A", "B"}:
+        orig_path = next(path for path in files if ("上衣" not in path.name and "底裤" not in path.name))
+        top_path = next(path for path in files if "上衣" in path.name)
+        bottom_path = next(path for path in files if "底裤" in path.name)
+        return {
+            "label": sample_name,
+            "region_count": 2,
+            "orig_img": read_image_path(orig_path),
+            "region_sources": [
+                {"name": "上衣", "mask_source": read_image_path(top_path)},
+                {"name": "底裤", "mask_source": read_image_path(bottom_path)},
+            ],
+        }
+    alpha_files = [path for path in files if read_image_path(path) is not None and extract_alpha(read_image_path(path)) is not None]
+    mask_path = alpha_files[0] if alpha_files else files[-1]
+    orig_path = next(path for path in files if path != mask_path)
+    return {
+        "label": sample_name,
+        "region_count": 1,
+        "orig_img": read_image_path(orig_path),
+        "region_sources": [{"name": "主体", "mask_source": read_image_path(mask_path)}],
+    }
+
+
+def available_sample_names() -> list[str]:
+    names: list[str] = []
+    for sample_name in ["A", "B", "C", "D"]:
+        folder = APP_DIR / sample_name
+        if not folder.exists() or not folder.is_dir():
+            continue
+        try:
+            has_images = any(path.suffix.lower() in IMAGE_SUFFIXES for path in folder.iterdir())
+        except OSError:
+            has_images = False
+        if has_images:
+            names.append(sample_name)
+    return names
+
+
+def render_result_downloads(result: dict[str, Any]) -> None:
+    if not result["combos"]:
+        st.warning("没有生成可用候选图，请检查蒙版或参考图。")
+        return
+    best = result["combos"][0]
+    jpg_bytes = image_to_bytes(best["image"], ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+    zip_bytes = build_export_zip(result)
+    download_cols = st.columns(3)
+    with download_cols[0]:
+        st.download_button("下载最佳 JPG", jpg_bytes, file_name=f"{slugify(result['job_label'])}_best.jpg", mime="image/jpeg", use_container_width=True)
+    with download_cols[1]:
+        st.download_button("下载分层 PSD", result["psd_bytes"], file_name=f"{slugify(result['job_label'])}_best.psd", mime="image/vnd.adobe.photoshop", use_container_width=True)
+    with download_cols[2]:
+        st.download_button("下载导出包 ZIP", zip_bytes, file_name=f"{slugify(result['job_label'])}_export.zip", mime="application/zip", use_container_width=True)
+
+
+def render_candidate_gallery(result: dict[str, Any]) -> None:
+    combos = result["combos"][:5]
+    if not combos:
+        return
+    cards_html: list[str] = []
+    for idx, combo in enumerate(combos, start=1):
+        refs_html = "".join(
+            f"""
+            <div class="ref-item">
+              <div class="ref-title">{target['label']} 参考模特图</div>
+              <img src="data:image/jpeg;base64,{image_to_base64_jpg(target['image_bgr'])}" />
+            </div>
+            """
+            for target in result["targets"]
+        )
+        cards_html.append(
+            f"""
+            <article class="candidate-card">
+              <div class="candidate-head">候选 {idx} | DeltaE {combo['de']:.2f}</div>
+              <div class="refs-wrap">{refs_html}</div>
+              <div class="result-wrap">
+                <img src="data:image/jpeg;base64,{image_to_base64_jpg(combo['image'])}" />
+              </div>
+            </article>
+            """
+        )
+    html = f"""
+    <!doctype html>
+    <html lang="zh-CN">
+    <head>
+      <meta charset="utf-8" />
+      <style>
+        body {{
+          margin: 0;
+          font-family: "Segoe UI", "PingFang SC", sans-serif;
+          background: #f7f3ec;
+        }}
+        .gallery {{
+          display: flex;
+          gap: 16px;
+          overflow-x: auto;
+          padding: 8px 6px 16px;
+          cursor: grab;
+          scroll-behavior: smooth;
+        }}
+        .gallery.dragging {{
+          cursor: grabbing;
+          user-select: none;
+        }}
+        .candidate-card {{
+          flex: 0 0 360px;
+          background: #fffdf9;
+          border: 1px solid #e3d7c6;
+          border-radius: 18px;
+          overflow: hidden;
+          box-shadow: 0 10px 24px rgba(77, 54, 26, 0.08);
+        }}
+        .candidate-head {{
+          padding: 14px 16px 10px;
+          font-size: 15px;
+          font-weight: 700;
+          color: #334155;
+        }}
+        .refs-wrap {{
+          display: grid;
+          gap: 10px;
+          padding: 0 12px 12px;
+        }}
+        .ref-item {{
+          background: #faf7f2;
+          border: 1px solid #eadfce;
+          border-radius: 14px;
+          padding: 10px;
+        }}
+        .ref-title {{
+          font-size: 13px;
+          color: #64748b;
+          margin-bottom: 8px;
+        }}
+        .result-wrap {{
+          padding: 0 12px 14px;
+        }}
+        img {{
+          width: 100%;
+          display: block;
+          border-radius: 12px;
+          border: 1px solid #eadfce;
+        }}
+      </style>
+    </head>
+    <body>
+      <div id="gallery" class="gallery">{''.join(cards_html)}</div>
+      <script>
+        const gallery = document.getElementById("gallery");
+        let isDown = false;
+        let startX = 0;
+        let scrollLeft = 0;
+        gallery.addEventListener("mousedown", (event) => {{
+          isDown = true;
+          gallery.classList.add("dragging");
+          startX = event.pageX - gallery.offsetLeft;
+          scrollLeft = gallery.scrollLeft;
+        }});
+        gallery.addEventListener("mouseleave", () => {{
+          isDown = false;
+          gallery.classList.remove("dragging");
+        }});
+        gallery.addEventListener("mouseup", () => {{
+          isDown = false;
+          gallery.classList.remove("dragging");
+        }});
+        gallery.addEventListener("mousemove", (event) => {{
+          if (!isDown) return;
+          event.preventDefault();
+          const x = event.pageX - gallery.offsetLeft;
+          const walk = (x - startX) * 1.1;
+          gallery.scrollLeft = scrollLeft - walk;
+        }});
+      </script>
+    </body>
+    </html>
+    """
+    components.html(html, height=860, scrolling=False)
+
+
+def build_single_job_ui() -> None:
+    st.subheader("单次调色")
+    st.caption("每个颜色分成两张参考图：带模特校验图必传，纯色色块图可选。不上传纯色色块时，会自动回退使用校验图提取渲染色。")
+    sample_names = available_sample_names()
+    has_local_samples = bool(sample_names)
+    source_options = ["本地样例", "手动上传"] if has_local_samples else ["手动上传"]
+    source_mode = st.radio("输入方式", source_options, horizontal=True)
+    if not has_local_samples:
+        st.info("当前环境没有内置样例目录，已自动切换到手动上传模式。")
+
+    sample_name = "manual"
+    if source_mode == "本地样例" and has_local_samples:
+        sample_name = st.selectbox("选择样例", sample_names)
+        try:
+            sample = discover_sample_bundle(sample_name)
+        except FileNotFoundError:
+            st.warning("本地样例资源不存在，已切换为手动上传模式。")
+            source_mode = "手动上传"
+            sample = None
+        if sample is not None:
+            region_count = sample["region_count"]
+            orig_img = sample["orig_img"]
+            region_sources = sample["region_sources"]
+        else:
+            region_count = st.radio("套装区域数", [1, 2], horizontal=True, format_func=lambda value: "一件套" if value == 1 else "两件套")
+            orig_file = st.file_uploader("上传原图", type=["jpg", "jpeg", "png"])
+            orig_img = load_uploaded_image(orig_file)
+            region_sources = []
+            if region_count == 1:
+                mask_file = st.file_uploader("上传主体蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="mask_one_fallback")
+                region_sources.append({"name": "主体", "mask_source": load_uploaded_image(mask_file)})
+            else:
+                top_file = st.file_uploader("上传上衣蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="mask_top_fallback")
+                bottom_file = st.file_uploader("上传底裤蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="mask_bottom_fallback")
+                region_sources.extend(
+                    [
+                        {"name": "上衣", "mask_source": load_uploaded_image(top_file)},
+                        {"name": "底裤", "mask_source": load_uploaded_image(bottom_file)},
+                    ]
+                )
+    else:
+        region_count = st.radio("套装区域数", [1, 2], horizontal=True, format_func=lambda value: "一件套" if value == 1 else "两件套")
+        orig_file = st.file_uploader("上传原图", type=["jpg", "jpeg", "png"])
+        orig_img = load_uploaded_image(orig_file)
+        region_sources = []
+        if region_count == 1:
+            mask_file = st.file_uploader("上传主体蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="mask_one")
+            region_sources.append({"name": "主体", "mask_source": load_uploaded_image(mask_file)})
+        else:
+            top_file = st.file_uploader("上传上衣蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="mask_top")
+            bottom_file = st.file_uploader("上传底裤蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="mask_bottom")
+            region_sources.extend(
+                [
+                    {"name": "上衣", "mask_source": load_uploaded_image(top_file)},
+                    {"name": "底裤", "mask_source": load_uploaded_image(bottom_file)},
+                ]
+            )
+
+    color_count = 1 if region_count == 1 else st.radio("调色数量", [1, 2], horizontal=True, format_func=lambda value: "同一颜色" if value == 1 else "两个颜色")
+    ref_paths = list_reference_paths() if source_mode == "本地样例" else []
+    if source_mode == "本地样例" and not ref_paths:
+        st.info("当前环境没有内置颜色参考目录，请改用上传校验图。")
+
+    ref_inputs: list[dict[str, Any]] = []
+    ref_name_map = {path.name: path for path in ref_paths}
+    ref_name_options = list(ref_name_map.keys())
+    st.markdown("**颜色参考图**")
+    st.caption("带模特校验图用于计算 DeltaE。纯色色块图只用于定义目标渲染色，不传也可以先跑。")
+    for idx in range(color_count):
+        label_default = f"颜色 {idx + 1}"
+        with st.container(border=True):
+            st.markdown(f"**{label_default}**")
+            if source_mode == "本地样例" and ref_name_options:
+                default_index = min(idx, len(ref_name_options) - 1)
+                validation_name = st.selectbox(
+                    f"{label_default} 选择带模特校验图",
+                    ref_name_options,
+                    index=default_index,
+                    key=f"validation_ref_{idx}",
+                )
+                validation_path = ref_name_map[validation_name]
+                validation_image = read_image_path(validation_path)
+                label = validation_path.stem
+            else:
+                validation_file = st.file_uploader(
+                    f"{label_default} 上传带模特校验图（必传）",
+                    type=["jpg", "jpeg", "png"],
+                    key=f"validation_upload_{idx}",
+                )
+                validation_image = load_uploaded_image(validation_file)
+                label = Path(validation_file.name).stem if validation_file is not None else label_default
+            render_file = st.file_uploader(
+                f"{label_default} 上传纯色色块图（可选）",
+                type=["jpg", "jpeg", "png"],
+                key=f"render_upload_{idx}",
+            )
+            render_image = load_uploaded_image(render_file)
+            if render_image is None:
+                st.caption("未上传纯色色块图时，会回退使用校验图提取渲染色。")
+            ref_inputs.append(
+                {
+                    "label": label,
+                    "validation_image": validation_image,
+                    "render_image": render_image,
+                }
+            )
+
+    if region_count == 1:
+        region_map = [0]
+    elif color_count == 1:
+        region_map = [0, 0]
+    else:
+        region_map = [0, 1]
+
+    if st.button("开始调色并寻找最小 DeltaE", use_container_width=True):
+        if orig_img is None:
+            st.error("请先提供原图。")
+            return
+        if any(item["mask_source"] is None for item in region_sources):
+            st.error("请先提供所有区域的蒙版或对齐白底图。")
+            return
+        if any(item["validation_image"] is None for item in ref_inputs):
+            st.error("请先提供每个颜色的带模特校验图。")
+            return
+        with st.spinner("正在按“校验图算 DeltaE、纯色色块图优先定渲染色”的逻辑搜索前 5 张最佳结果..."):
+            result = build_job_inputs(
+                "手动调色任务" if source_mode == "手动上传" else f"{sample_name}_调色任务",
+                orig_img,
+                region_sources,
+                ref_inputs,
+                region_map,
+                top_n=5,
+            )
+        st.success(f"已完成，共生成 {len(result['combos'])} 组候选结果。")
+        render_result_downloads(result)
+        render_candidate_gallery(result)
+
+
+def unique_best_candidates(candidates: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for cand in sorted(candidates, key=lambda item: item["de"]):
+        key = tuple(round(float(p), 3 if idx == 0 else 2) for idx, p in enumerate(cand["params"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(cand)
+        if len(unique) >= limit:
+            break
+    return unique
+
+
+def expand_region_candidates(
+    orig_bgr: np.ndarray,
+    mask_3d: np.ndarray,
+    target: dict[str, Any],
+    label: str,
+    candidates: list[dict[str, Any]],
+    desired_count: int,
+) -> list[dict[str, Any]]:
+    if len(candidates) >= desired_count:
+        return candidates[:desired_count]
+    gray = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2GRAY)
+    render_lab = target["render_lab"]
+    std_lab = target["std_lab"]
+    is_neon = abs(float(render_lab[1]) - 128.0) > 26 or abs(float(render_lab[2]) - 128.0) > 28
+    extra_candidates = list(candidates)
+    seed_params = [cand["params"] for cand in candidates[: max(1, len(candidates))]]
+    if not seed_params:
+        seed_params = [(0.0, 0.0, 0.0, 118.0)] if is_neon else [(1.00, 0.0, 0.0, 0.0, 1.22)]
+    if is_neon:
+        deltas: list[tuple[float, ...]] = [
+            (-4.0, 0.0, 0.0, 0.0),
+            (4.0, 0.0, 0.0, 0.0),
+            (0.0, -4.0, 0.0, 0.0),
+            (0.0, 4.0, 0.0, 0.0),
+            (0.0, 0.0, -4.0, 0.0),
+            (0.0, 0.0, 4.0, 0.0),
+            (0.0, 0.0, 0.0, -12.0),
+            (0.0, 0.0, 0.0, 12.0),
+        ]
+    else:
+        deltas = [
+            (-0.02, 0.0, 0.0, 0.0, -0.05),
+            (0.02, 0.0, 0.0, 0.0, 0.05),
+            (0.0, -4.0, 0.0, 0.0, 0.0),
+            (0.0, 4.0, 0.0, 0.0, 0.0),
+            (0.0, 0.0, -3.0, 0.0, 0.0),
+            (0.0, 0.0, 3.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0, -3.0, 0.0),
+            (0.0, 0.0, 0.0, 3.0, 0.0),
+        ]
+    for base in seed_params:
+        for delta in deltas:
+            if len(extra_candidates) >= desired_count * 2:
+                break
+            if is_neon:
+                trial = clamp_neon_params(tuple(float(base[i] + delta[i]) for i in range(4)))
+            else:
+                trial = clamp_standard_params(tuple(float(base[i] + delta[i]) for i in range(5)))
+            img_hr = render_region(orig_bgr, gray, mask_3d, render_lab, trial, is_neon)
+            de, current_std_lab = evaluate_delta_e(img_hr, mask_3d, std_lab)
+            extra_candidates.append(
+                {
+                    "params": trial,
+                    "de": de,
+                    "lab": current_std_lab,
+                    "image": img_hr,
+                    "label": label,
+                    "is_neon": is_neon,
+                }
+            )
+    return unique_best_candidates(extra_candidates, desired_count)
+
+
+def build_job_inputs(
+    job_label: str,
+    orig_img: np.ndarray,
+    region_sources: list[dict[str, Any]],
+    ref_inputs: list[dict[str, Any]],
+    region_to_target: list[int],
+    top_n: int = 3,
+) -> dict[str, Any]:
+    orig_bgr = ensure_bgr(orig_img)
+    targets = [analyze_target_input(item) for item in ref_inputs]
+    regions = []
+    for index, region in enumerate(region_sources):
+        mask_3d = preprocess_mask(region["mask_source"], orig_bgr.shape[:2])
+        target = targets[region_to_target[index]]
+        candidates = optimize_region_candidates(orig_bgr, mask_3d, target, region["name"], top_n=max(top_n + 1, 4))
+        candidates = expand_region_candidates(orig_bgr, mask_3d, target, region["name"], candidates, max(top_n + 1, 4))
+        regions.append(
+            {
+                "name": region["name"],
+                "mask_3d": mask_3d,
+                "target": target,
+                "candidates": candidates,
+            }
+        )
+    combos = build_result_combinations(orig_bgr, regions, top_n=top_n)
+    best_combo = combos[0] if combos else None
+    payload = build_result_payload(job_label, targets, regions, combos)
+    html = build_result_html(job_label, orig_bgr, targets, combos) if combos else ""
+    psd_bytes = create_layered_psd_bytes(job_label, orig_bgr, best_combo, targets, regions) if best_combo else b""
+    return {
+        "job_label": job_label,
+        "orig_bgr": orig_bgr,
+        "targets": targets,
+        "regions": regions,
+        "combos": combos,
+        "payload": payload,
+        "html": html,
+        "psd_bytes": psd_bytes,
+    }
+
+
+def build_result_combinations(orig_img: np.ndarray, regions: list[dict[str, Any]], top_n: int = 3) -> list[dict[str, Any]]:
+    if not regions:
+        return []
+    if len(regions) == 1:
+        combos = [
+            {
+                "image": cand["image"],
+                "de": float(cand["de"]),
+                "score": float(cand["de"]),
+                "region_de": {regions[0]["name"]: float(cand["de"])},
+                "candidate_map": {regions[0]["name"]: cand},
+                "harmony_penalty": 0.0,
+                "harmony_pairs": {},
+            }
+            for cand in regions[0]["candidates"]
+        ]
+        return combos[:top_n]
+    combos: list[dict[str, Any]] = []
+    weights = [max(float(np.count_nonzero(region["mask_3d"][:, :, 0] > 0.08)), 1.0) for region in regions]
+    candidate_lists = [region["candidates"][: max(top_n + 1, 4)] for region in regions]
+    for picks in product(*candidate_lists):
+        composed = orig_img.copy()
+        region_de: dict[str, float] = {}
+        candidate_map: dict[str, Any] = {}
+        for region, cand in zip(regions, picks):
+            composed = composite_with_mask(composed, cand["image"], region["mask_3d"])
+            region_score = float(cand["de"])
+            region_de[region["name"]] = region_score
+            candidate_map[region["name"]] = cand
+        harmony_penalty, harmony_pairs = compute_same_target_harmony_penalty(regions, candidate_map)
+        harmonized = harmonize_same_target_regions(composed, regions) if harmony_penalty > 0.0 else composed
+        if harmony_penalty > 0.0:
+            adjusted_region_de: dict[str, float] = {}
+            for region in regions:
+                region_score, _ = evaluate_delta_e(harmonized, region["mask_3d"], region["target"]["std_lab"])
+                adjusted_region_de[region["name"]] = region_score
+            region_de = adjusted_region_de
+            composed = harmonized
+        total_de = float(np.average(list(region_de.values()), weights=weights))
+        score = total_de + harmony_penalty
+        combos.append(
+            {
+                "image": composed,
+                "de": total_de,
+                "score": score,
+                "region_de": region_de,
+                "candidate_map": candidate_map,
+                "harmony_penalty": harmony_penalty,
+                "harmony_pairs": harmony_pairs,
+            }
+        )
+    return sorted(combos, key=lambda x: x.get("score", x["de"]))[:top_n]
+
+
+def mask_visual_from_source(mask_source: np.ndarray | None, shape: tuple[int, int]) -> np.ndarray:
+    if mask_source is None:
+        alpha = np.zeros(shape, dtype=np.uint8)
+        return np.dstack([alpha, alpha, alpha])
+    resized = cv2.resize(ensure_bgr(mask_source), (shape[1], shape[0]), interpolation=cv2.INTER_AREA)
+    alpha = extract_alpha(mask_source)
+    if alpha is not None:
+        alpha = cv2.resize(alpha, (shape[1], shape[0]), interpolation=cv2.INTER_AREA)
+        return np.dstack([alpha, alpha, alpha])
+    if resized.ndim == 2:
+        return cv2.cvtColor(resized, cv2.COLOR_GRAY2BGR)
+    return resized
+
+
+def build_shadow_wrinkle_layer(orig_bgr: np.ndarray, mask_3d: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2GRAY)
+    shadow = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    mask = np.clip(mask_3d[:, :, 0], 0.0, 1.0)
+    base = np.full_like(shadow, 255, dtype=np.uint8)
+    return blend_with_alpha(base, shadow, mask)
+
+
+def build_levels_compensation_layer(orig_bgr: np.ndarray, mask_3d: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    normalized = gray / 255.0
+    lifted = 78.0 + normalized * (255.0 - 78.0)
+    gamma_corrected = np.power(np.clip(lifted / 255.0, 0.0, 1.0), 0.82) * 255.0
+    comp = cv2.cvtColor(np.clip(gamma_corrected, 0.0, 255.0).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+    mask = np.clip(mask_3d[:, :, 0] * 0.72, 0.0, 1.0)
+    base = np.full_like(comp, 255, dtype=np.uint8)
+    return blend_with_alpha(base, comp, mask)
+
+
+def build_highlight_stitch_layer(orig_bgr: np.ndarray, mask_3d: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (0, 0), 1.8)
+    high_pass = cv2.addWeighted(gray, 1.0, blurred, -1.0, 128)
+    high_pass = cv2.cvtColor(np.clip(high_pass, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+    mask = np.clip(mask_3d[:, :, 0], 0.0, 1.0)
+    neutral = np.full_like(high_pass, 128, dtype=np.uint8)
+    return blend_with_alpha(neutral, high_pass, mask)
+
+
+def build_base_fill_layer(shape: tuple[int, int], rgb: tuple[int, int, int], mask_3d: np.ndarray) -> np.ndarray:
+    fill = np.full((shape[0], shape[1], 3), (rgb[2], rgb[1], rgb[0]), dtype=np.uint8)
+    base = np.full_like(fill, 255, dtype=np.uint8)
+    return blend_with_alpha(base, fill, np.clip(mask_3d[:, :, 0], 0.0, 1.0))
+
+
+def create_layered_psd_bytes(job_label: str, orig_bgr: np.ndarray, best_combo: dict[str, Any], targets: list[dict[str, Any]], regions: list[dict[str, Any]]) -> bytes:
+    try:
+        from pytoshop import enums
+        from pytoshop.user import nested_layers
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(f"PSD dependency unavailable: {exc}") from exc
+
+    def rgb_channels(img_bgr: np.ndarray, alpha: np.ndarray | None = None) -> dict[int, np.ndarray]:
+        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        if alpha is None:
+            alpha = np.full(rgb.shape[:2], 255, dtype=np.uint8)
+        return {
+            0: rgb[:, :, 0].astype(np.uint8),
+            1: rgb[:, :, 1].astype(np.uint8),
+            2: rgb[:, :, 2].astype(np.uint8),
+            enums.ChannelId.transparency: alpha.astype(np.uint8),
+        }
+
+    h, w = orig_bgr.shape[:2]
+    garment_groups: list[Any] = []
+    for region in regions:
+        target = region["target"]
+        mask_alpha = np.clip(region["mask_3d"][:, :, 0] * 255.0, 0, 255).astype(np.uint8)
+        mask_visual = mask_visual_from_source(region.get("mask_source"), (h, w))
+        shadow_layer = build_shadow_wrinkle_layer(orig_bgr, region["mask_3d"])
+        levels_layer = build_levels_compensation_layer(orig_bgr, region["mask_3d"])
+        detail_layer = build_highlight_stitch_layer(orig_bgr, region["mask_3d"])
+        base_fill = build_base_fill_layer((h, w), target["spec"].rgb, region["mask_3d"])
+        group_name = f"{region['name']}_mockup" if len(regions) > 1 else "mockup"
+        garment_groups.append(
+            nested_layers.Group(
+                name=group_name,
+                layers=[
+                    nested_layers.Image(
+                        name="高光 & 缝线细节层",
+                        top=0,
+                        left=0,
+                        blend_mode=enums.BlendMode.overlay,
+                        opacity=255,
+                        channels=rgb_channels(detail_layer, mask_alpha),
+                        color_mode=enums.ColorMode.rgb,
+                    ),
+                    nested_layers.Image(
+                        name="色阶补偿层",
+                        top=0,
+                        left=0,
+                        blend_mode=enums.BlendMode.screen,
+                        opacity=188,
+                        channels=rgb_channels(levels_layer, mask_alpha),
+                        color_mode=enums.ColorMode.rgb,
+                    ),
+                    nested_layers.Image(
+                        name="阴影 & 褶皱层",
+                        top=0,
+                        left=0,
+                        blend_mode=enums.BlendMode.luminosity,
+                        opacity=255,
+                        channels=rgb_channels(shadow_layer, mask_alpha),
+                        color_mode=enums.ColorMode.rgb,
+                    ),
+                    nested_layers.Image(
+                        name="底色层 - 双击此处替换颜色/图案",
+                        top=0,
+                        left=0,
+                        blend_mode=enums.BlendMode.normal,
+                        opacity=255,
+                        channels=rgb_channels(base_fill, mask_alpha),
+                        color_mode=enums.ColorMode.rgb,
+                    ),
+                    nested_layers.Image(
+                        name="蒙版图",
+                        top=0,
+                        left=0,
+                        visible=False,
+                        channels=rgb_channels(mask_visual),
+                        color_mode=enums.ColorMode.rgb,
+                    ),
+                ],
+                closed=False,
+                visible=True,
+            )
+        )
+
+    reference_layers: list[Any] = []
+    for idx, target in enumerate(targets):
+        reference_layers.append(
+            nested_layers.Group(
+                name=f"{target['label']}_参考",
+                layers=[
+                    nested_layers.Image(
+                        name=f"{target['label']}_校验模特图",
+                        top=0,
+                        left=0,
+                        channels=rgb_channels(target["image_bgr"]),
+                        color_mode=enums.ColorMode.rgb,
+                    ),
+                    nested_layers.Image(
+                        name=f"{target['label']}_校验区域预览",
+                        top=0,
+                        left=0,
+                        visible=False,
+                        channels=rgb_channels(target["focus_bgr"]),
+                        color_mode=enums.ColorMode.rgb,
+                    ),
+                    nested_layers.Image(
+                        name=f"{target['label']}_渲染色卡",
+                        top=40 + idx * 140,
+                        left=40,
+                        channels=rgb_channels(target["render_source_chip_bgr"]),
+                        color_mode=enums.ColorMode.rgb,
+                    ),
+                ],
+                closed=True,
+                visible=False,
+            )
+        )
+
+    final_preview = nested_layers.Image(
+        name="当前最佳预览",
+        top=0,
+        left=0,
+        visible=False,
+        channels=rgb_channels(best_combo["image"]),
+        color_mode=enums.ColorMode.rgb,
+    )
+    model_layer = nested_layers.Image(
+        name="模特图",
+        top=0,
+        left=0,
+        channels=rgb_channels(orig_bgr),
+        color_mode=enums.ColorMode.rgb,
+    )
+
+    layer_stack: list[Any] = [
+        nested_layers.Group(name="Mockup 模板", layers=garment_groups, closed=False),
+        nested_layers.Group(name="参考图层", layers=reference_layers, closed=True, visible=False),
+        final_preview,
+        model_layer,
+    ]
+    psd = nested_layers.nested_layers_to_psd(
+        layer_stack,
+        color_mode=enums.ColorMode.rgb,
+        size=(h, w),
+        compression=enums.Compression.raw,
+    )
+    buffer = io.BytesIO()
+    psd.write(buffer)
+    return buffer.getvalue()
+
+
+def build_job_inputs(
+    job_label: str,
+    orig_img: np.ndarray,
+    region_sources: list[dict[str, Any]],
+    ref_inputs: list[dict[str, Any]],
+    region_to_target: list[int],
+    top_n: int = 3,
+) -> dict[str, Any]:
+    orig_bgr = ensure_bgr(orig_img)
+    targets = [analyze_target_input(item) for item in ref_inputs]
+    regions = []
+    for index, region in enumerate(region_sources):
+        mask_3d = preprocess_mask(region["mask_source"], orig_bgr.shape[:2])
+        target = targets[region_to_target[index]]
+        candidates = optimize_region_candidates(orig_bgr, mask_3d, target, region["name"], top_n=max(top_n + 1, 4))
+        candidates = expand_region_candidates(orig_bgr, mask_3d, target, region["name"], candidates, max(top_n + 1, 4))
+        regions.append(
+            {
+                "name": region["name"],
+                "mask_3d": mask_3d,
+                "mask_source": region.get("mask_source"),
+                "target": target,
+                "candidates": candidates,
+            }
+        )
+    combos = build_result_combinations(orig_bgr, regions, top_n=top_n)
+    best_combo = combos[0] if combos else None
+    payload = build_result_payload(job_label, targets, regions, combos)
+    html = build_result_html(job_label, orig_bgr, targets, combos) if combos else ""
+    psd_bytes = create_layered_psd_bytes(job_label, orig_bgr, best_combo, targets, regions) if best_combo else b""
+    return {
+        "job_label": job_label,
+        "orig_bgr": orig_bgr,
+        "targets": targets,
+        "regions": regions,
+        "combos": combos,
+        "payload": payload,
+        "html": html,
+        "psd_bytes": psd_bytes,
+    }
 
 
 def main() -> None:
