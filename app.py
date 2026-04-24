@@ -2465,22 +2465,22 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
     combos = result["combos"][:5]
     if not combos:
         return
+    references_html = "".join(
+        f"""
+        <div class="ref-item">
+          <div class="ref-title">{target['label']} 参考模特图</div>
+          <img src="data:image/jpeg;base64,{image_to_base64_jpg(target['image_bgr'])}" />
+        </div>
+        """
+        for target in result["targets"]
+    )
     cards_html: list[str] = []
     for idx, combo in enumerate(combos, start=1):
-        refs_html = "".join(
-            f"""
-            <div class="ref-item">
-              <div class="ref-title">{target['label']} 参考模特图</div>
-              <img src="data:image/jpeg;base64,{image_to_base64_jpg(target['image_bgr'])}" />
-            </div>
-            """
-            for target in result["targets"]
-        )
         cards_html.append(
             f"""
             <article class="candidate-card">
-              <div class="candidate-head">候选 {idx} | DeltaE {combo['de']:.2f}</div>
-              <div class="refs-wrap">{refs_html}</div>
+              <div class="candidate-head">候选 {idx}</div>
+              <div class="candidate-meta">DeltaE {combo['de']:.2f}</div>
               <div class="result-wrap">
                 <img src="data:image/jpeg;base64,{image_to_base64_jpg(combo['image'])}" />
               </div>
@@ -2497,12 +2497,39 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
           margin: 0;
           font-family: "Segoe UI", "PingFang SC", sans-serif;
           background: #f7f3ec;
+          color: #334155;
+        }}
+        .shell {{
+          display: grid;
+          gap: 12px;
+          padding: 6px 4px 12px;
+        }}
+        .refs-panel {{
+          background: #fffdf9;
+          border: 1px solid #e3d7c6;
+          border-radius: 16px;
+          padding: 12px;
+        }}
+        .refs-title {{
+          font-size: 14px;
+          font-weight: 700;
+          margin-bottom: 10px;
+        }}
+        .refs-grid {{
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+          gap: 10px;
+        }}
+        .gallery-title {{
+          font-size: 14px;
+          font-weight: 700;
+          padding: 0 2px;
         }}
         .gallery {{
           display: flex;
-          gap: 16px;
+          gap: 12px;
           overflow-x: auto;
-          padding: 8px 6px 16px;
+          padding: 4px 2px 12px;
           cursor: grab;
           scroll-behavior: smooth;
         }}
@@ -2511,48 +2538,62 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
           user-select: none;
         }}
         .candidate-card {{
-          flex: 0 0 360px;
+          flex: 0 0 220px;
           background: #fffdf9;
           border: 1px solid #e3d7c6;
-          border-radius: 18px;
+          border-radius: 16px;
           overflow: hidden;
           box-shadow: 0 10px 24px rgba(77, 54, 26, 0.08);
         }}
         .candidate-head {{
-          padding: 14px 16px 10px;
-          font-size: 15px;
+          padding: 12px 12px 4px;
+          font-size: 14px;
           font-weight: 700;
-          color: #334155;
         }}
-        .refs-wrap {{
-          display: grid;
-          gap: 10px;
-          padding: 0 12px 12px;
+        .candidate-meta {{
+          padding: 0 12px 8px;
+          font-size: 13px;
+          color: #64748b;
         }}
         .ref-item {{
           background: #faf7f2;
           border: 1px solid #eadfce;
-          border-radius: 14px;
-          padding: 10px;
+          border-radius: 12px;
+          padding: 8px;
         }}
         .ref-title {{
-          font-size: 13px;
+          font-size: 12px;
           color: #64748b;
-          margin-bottom: 8px;
+          margin-bottom: 6px;
         }}
         .result-wrap {{
-          padding: 0 12px 14px;
+          padding: 0 10px 10px;
         }}
         img {{
           width: 100%;
           display: block;
-          border-radius: 12px;
+          border-radius: 10px;
           border: 1px solid #eadfce;
+          object-fit: contain;
+          background: #ffffff;
+        }}
+        .refs-panel img {{
+          max-height: 180px;
+        }}
+        .candidate-card img {{
+          max-height: 280px;
         }}
       </style>
     </head>
     <body>
-      <div id="gallery" class="gallery">{''.join(cards_html)}</div>
+      <div class="shell">
+        <section class="refs-panel">
+          <div class="refs-title">参考模特图</div>
+          <div class="refs-grid">{references_html}</div>
+        </section>
+        <div class="gallery-title">向左右滑动查看 5 张最佳候选</div>
+        <div id="gallery" class="gallery">{''.join(cards_html)}</div>
+      </div>
       <script>
         const gallery = document.getElementById("gallery");
         let isDown = false;
@@ -2583,7 +2624,7 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
     </body>
     </html>
     """
-    components.html(html, height=860, scrolling=False)
+    components.html(html, height=560, scrolling=False)
 
 
 def build_single_job_ui() -> None:
