@@ -1160,7 +1160,11 @@ def build_export_zip(result: dict[str, Any]) -> bytes:
 
 def discover_sample_bundle(sample_name: str) -> dict[str, Any]:
     folder = APP_DIR / sample_name
+    if not folder.exists() or not folder.is_dir():
+        raise FileNotFoundError(f"Sample folder not found: {folder}")
     files = sorted([path for path in folder.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES])
+    if not files:
+        raise FileNotFoundError(f"No image files found in sample folder: {folder}")
     if sample_name in {"A", "B"}:
         orig_path = next(path for path in files if ("上衣" not in path.name and "底裤" not in path.name))
         top_path = next(path for path in files if "上衣" in path.name)
@@ -1185,8 +1189,25 @@ def discover_sample_bundle(sample_name: str) -> dict[str, Any]:
     }
 
 
+def available_sample_names() -> list[str]:
+    names: list[str] = []
+    for sample_name in ["A", "B", "C"]:
+        folder = APP_DIR / sample_name
+        if not folder.exists() or not folder.is_dir():
+            continue
+        try:
+            has_images = any(path.suffix.lower() in IMAGE_SUFFIXES for path in folder.iterdir())
+        except OSError:
+            has_images = False
+        if has_images:
+            names.append(sample_name)
+    return names
+
+
 def list_reference_paths() -> list[Path]:
     folder = APP_DIR / "颜色参考"
+    if not folder.exists() or not folder.is_dir():
+        return []
     return sorted([path for path in folder.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES])
 
 
@@ -1346,7 +1367,12 @@ def analyze_reference_folder(reference_paths: list[Path] | None = None) -> dict[
 
 def run_demo_batch_tests(max_cases: int = 6) -> dict[str, Any]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    if not available_sample_names():
+        raise ValueError("No local sample folders available for batch testing.")
     style_refs = select_reference_paths_for_styles()
+    required_styles = {"white", "light", "dark", "neon"}
+    if not required_styles.issubset(style_refs.keys()):
+        raise ValueError("Reference images are missing for one or more required style categories.")
     cases = [
         ("C_白色_一件套", "C", [style_refs["white"]], [0], ["white"]),
         ("C_深色_一件套", "C", [style_refs["dark"]], [0], ["dark"]),
@@ -1489,14 +1515,42 @@ def load_uploaded_image(uploaded_file: Any) -> np.ndarray | None:
 def build_single_job_ui() -> None:
     st.subheader("单次调色")
     st.caption("支持一件套 / 两件套，可自定义调色数量。两件套可选择同色或异色。蒙版支持黑白图、透明 PNG，或与原图同尺寸对齐的白底商品图。结果导出以 JPG 为主。")
-    source_mode = st.radio("输入方式", ["本地样例", "手动上传"], horizontal=True)
+    sample_names = available_sample_names()
+    has_local_samples = bool(sample_names)
+    source_options = ["本地样例", "手动上传"] if has_local_samples else ["手动上传"]
+    source_mode = st.radio("输入方式", source_options, horizontal=True)
+    if not has_local_samples:
+        st.info("当前运行环境没有内置样例目录，已自动切换为手动上传模式。")
 
-    if source_mode == "本地样例":
-        sample_name = st.selectbox("选择样例", ["A", "B", "C"])
-        sample = discover_sample_bundle(sample_name)
-        region_count = sample["region_count"]
-        orig_img = sample["orig_img"]
-        region_sources = sample["region_sources"]
+    if source_mode == "本地样例" and has_local_samples:
+        sample_name = st.selectbox("选择样例", sample_names)
+        try:
+            sample = discover_sample_bundle(sample_name)
+        except FileNotFoundError:
+            st.warning("本地样例资源不存在，已切换为手动上传模式。")
+            source_mode = "手动上传"
+            sample = None
+        if sample is not None:
+            region_count = sample["region_count"]
+            orig_img = sample["orig_img"]
+            region_sources = sample["region_sources"]
+        else:
+            region_count = st.radio("套装区域数", [1, 2], horizontal=True, format_func=lambda value: "一件套" if value == 1 else "两件套")
+            orig_file = st.file_uploader("上传原图", type=["jpg", "jpeg", "png"])
+            orig_img = load_uploaded_image(orig_file)
+            region_sources = []
+            if region_count == 1:
+                mask_file = st.file_uploader("上传主体蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="mask_one_fallback")
+                region_sources.append({"name": "主体", "mask_source": load_uploaded_image(mask_file)})
+            else:
+                top_file = st.file_uploader("上传上衣蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="mask_top_fallback")
+                bottom_file = st.file_uploader("上传底裤蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="mask_bottom_fallback")
+                region_sources.extend(
+                    [
+                        {"name": "上衣", "mask_source": load_uploaded_image(top_file)},
+                        {"name": "底裤", "mask_source": load_uploaded_image(bottom_file)},
+                    ]
+                )
     else:
         region_count = st.radio("套装区域数", [1, 2], horizontal=True, format_func=lambda value: "一件套" if value == 1 else "两件套")
         orig_file = st.file_uploader("上传原图", type=["jpg", "jpeg", "png"])
@@ -1518,7 +1572,7 @@ def build_single_job_ui() -> None:
     color_count = 1 if region_count == 1 else st.radio("调色数量", [1, 2], horizontal=True, format_func=lambda value: "同一颜色" if value == 1 else "两个颜色")
     ref_paths = list_reference_paths() if source_mode == "本地样例" else []
     ref_inputs = []
-    if source_mode == "本地样例":
+    if source_mode == "本地样例" and ref_paths:
         ref_names = {path.name: path for path in ref_paths}
         if color_count == 1:
             ref_name = st.selectbox("颜色参考 1", list(ref_names.keys()))
@@ -1529,6 +1583,8 @@ def build_single_job_ui() -> None:
             ref_inputs.append({"label": Path(ref_name_a).stem, "image": read_image_path(ref_names[ref_name_a])})
             ref_inputs.append({"label": Path(ref_name_b).stem, "image": read_image_path(ref_names[ref_name_b])})
     else:
+        if source_mode == "本地样例" and not ref_paths:
+            st.info("当前运行环境没有内置颜色参考目录，请改为上传参考图。")
         if color_count == 1:
             ref_file = st.file_uploader("上传颜色参考图", type=["jpg", "jpeg", "png"], key="single_ref")
             ref_inputs.append({"label": "颜色参考 1", "image": load_uploaded_image(ref_file)})
@@ -1578,6 +1634,12 @@ def build_batch_ui() -> None:
     st.subheader("本地批量测试")
     st.caption("会自动跑一件套 / 两件套 / 同色 / 异色多个案例，并覆盖白色、浅色、深色、荧光色，输出最小 DeltaE 的 JPG、PSD、HTML 和 JSON。")
     if st.button("运行本地批量测试", use_container_width=True):
+        if not available_sample_names():
+            st.warning("当前运行环境没有本地样例目录，无法执行批量测试。")
+            return
+        if not list_reference_paths():
+            st.warning("当前运行环境没有本地颜色参考目录，无法执行批量测试。")
+            return
         with st.spinner("正在批量测试，请稍候..."):
             summary = run_demo_batch_tests()
         st.success("批量测试完成。")
@@ -1591,6 +1653,9 @@ def build_palette_ui() -> None:
     st.subheader("颜色参考目录分析")
     st.caption("建议未来统一保存两套色值：HEX 用于 HTML / 商品后台，LAB 用于自动调色与最小色差匹配。")
     if st.button("分析颜色参考目录", use_container_width=True):
+        if not list_reference_paths():
+            st.warning("当前运行环境没有本地颜色参考目录，请在仓库中提供 `颜色参考` 文件夹，或仅使用手动上传模式。")
+            return
         with st.spinner("正在分析颜色参考目录..."):
             report = analyze_reference_folder()
         for row in report["rows"]:
