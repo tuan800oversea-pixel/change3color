@@ -2745,7 +2745,7 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
     </body>
     </html>
     """
-    components.html(html, height=500, scrolling=False)
+    components.html(html, height=800, scrolling=False)
 
 
 def build_single_job_ui() -> None:
