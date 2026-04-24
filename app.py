@@ -374,23 +374,71 @@ def extract_region_std_lab(img_bgr: np.ndarray, mask_3d: np.ndarray | None = Non
     return extract_masked_mean_std_lab(img_bgr, mask_3d)
 
 
-def analyze_reference_image(ref_img: np.ndarray, label: str) -> dict[str, Any]:
+def analyze_validation_reference_image(ref_img: np.ndarray, label: str) -> dict[str, Any]:
     bgr = ensure_bgr(ref_img)
     mask_3d = build_reference_mask(bgr)
-    render_lab = extract_region_lab_8bit(bgr, mask_3d)
     std_lab = extract_masked_mean_std_lab(bgr, mask_3d)
+    fallback_render_lab = extract_region_lab_8bit(bgr, mask_3d)
     spec = build_color_spec(label, std_lab)
-    style = classify_target_style(render_lab)
     return {
         "label": label,
         "image_bgr": bgr,
         "mask_3d": mask_3d,
-        "render_lab": render_lab.astype(np.float32),
         "std_lab": std_lab.astype(np.float32),
+        "fallback_render_lab": fallback_render_lab.astype(np.float32),
         "spec": spec,
-        "style": style,
         "chip_bgr": create_color_chip(spec.rgb, text=spec.hex),
         "focus_bgr": create_focus_preview(bgr, mask_3d),
+    }
+
+
+def analyze_render_reference_image(ref_img: np.ndarray, label: str) -> dict[str, Any]:
+    bgr = ensure_bgr(ref_img)
+    render_lab = extract_region_lab_8bit(bgr)
+    render_std_lab = lab8_to_std(render_lab)
+    render_spec = build_color_spec(f"{label}_render", render_std_lab)
+    return {
+        "image_bgr": bgr,
+        "render_lab": render_lab.astype(np.float32),
+        "render_spec": render_spec,
+        "chip_bgr": create_color_chip(render_spec.rgb, text=render_spec.hex),
+    }
+
+
+def analyze_target_input(target_input: dict[str, Any]) -> dict[str, Any]:
+    label = target_input["label"]
+    validation = analyze_validation_reference_image(target_input["validation_image"], label)
+    render_image = target_input.get("render_image")
+    if render_image is not None:
+        render_source = analyze_render_reference_image(render_image, label)
+        render_lab = render_source["render_lab"]
+        render_source_kind = "纯色色块图"
+        render_source_bgr = render_source["image_bgr"]
+        render_source_chip_bgr = render_source["chip_bgr"]
+        render_source_hex = render_source["render_spec"].hex
+    else:
+        render_lab = validation["fallback_render_lab"]
+        render_source_kind = "校验模特图回退"
+        render_source_bgr = validation["image_bgr"]
+        render_source_chip_bgr = validation["chip_bgr"]
+        render_source_hex = validation["spec"].hex
+    style = classify_target_style(render_lab)
+    return {
+        "label": label,
+        "image_bgr": validation["image_bgr"],
+        "mask_3d": validation["mask_3d"],
+        "render_lab": render_lab.astype(np.float32),
+        "std_lab": validation["std_lab"],
+        "spec": validation["spec"],
+        "style": style,
+        "chip_bgr": validation["chip_bgr"],
+        "focus_bgr": validation["focus_bgr"],
+        "validation_source_kind": "校验模特图",
+        "render_source_kind": render_source_kind,
+        "render_source_bgr": render_source_bgr,
+        "render_source_chip_bgr": render_source_chip_bgr,
+        "render_source_hex": render_source_hex,
+        "has_render_swatch": render_image is not None,
     }
 
 
@@ -829,19 +877,24 @@ def build_result_payload(job_label: str, targets: list[dict[str, Any]], regions:
     return {
         "job_label": job_label,
         "delta_e_method": {
-            "summary": "DeltaE 使用待模特颜色参考图的服装区域平均 CIELAB，与生成结果对应区域平均 CIELAB 做 CIEDE2000 比较。",
-            "render_color_source": "参考图服装区域主色，用于驱动渲染目标色。",
-            "compare_color_source": "参考图服装区域平均 LAB，用于最终 DeltaE 校验，包含高光和暗部影响。",
+            "summary": "DeltaE 使用带模特校验图的服装区域平均 CIELAB，与生成结果对应区域平均 CIELAB 做 CIEDE2000 比较。",
+            "render_color_source": "渲染目标色优先来自纯色色块图；如果未上传纯色色块图，则回退为带模特校验图的服装主色。",
+            "compare_color_source": "色差校验始终来自带模特校验图，保留高光和暗部影响。",
         },
         "targets": [
             {
                 "label": target["label"],
                 "color": color_spec_to_dict(target["spec"]),
                 "style": target.get("style", "normal"),
+                "render_source_kind": target.get("render_source_kind"),
+                "validation_source_kind": target.get("validation_source_kind"),
+                "render_source_hex": target.get("render_source_hex"),
                 "reference_export_files": {
-                    "source": f"references/{slugify(target['label'])}_source.jpg",
-                    "focus": f"references/{slugify(target['label'])}_focus.jpg",
-                    "chip": f"references/{slugify(target['label'])}_chip.jpg",
+                    "validation_source": f"references/{slugify(target['label'])}_validation_source.jpg",
+                    "validation_focus": f"references/{slugify(target['label'])}_validation_focus.jpg",
+                    "validation_chip": f"references/{slugify(target['label'])}_validation_chip.jpg",
+                    "render_source": f"references/{slugify(target['label'])}_render_source.jpg",
+                    "render_chip": f"references/{slugify(target['label'])}_render_chip.jpg",
                 },
             }
             for target in targets
@@ -886,9 +939,14 @@ def build_result_html(job_label: str, orig_bgr: np.ndarray, targets: list[dict[s
             [
                 f"""
                 <div class="compare-item">
-                  <div class="compare-label">参考图 {target['label']}</div>
+                  <div class="compare-label">{target['label']} 校验图</div>
                   <img src="data:image/jpeg;base64,{image_to_base64_jpg(target['image_bgr'])}" />
-                  <div class="compare-meta">{target.get('style', 'normal')} | {target['spec'].hex}</div>
+                  <div class="compare-meta">DeltaE 校验 | {target['spec'].hex}</div>
+                </div>
+                <div class="compare-item">
+                  <div class="compare-label">{target['label']} 渲染色</div>
+                  <img src="data:image/jpeg;base64,{image_to_base64_jpg(target['render_source_bgr'])}" />
+                  <div class="compare-meta">{target.get('render_source_kind', '校验模特图回退')} | {target.get('render_source_hex', target['spec'].hex)}</div>
                 </div>
                 """
                 for target in targets
@@ -925,7 +983,7 @@ def build_result_html(job_label: str, orig_bgr: np.ndarray, targets: list[dict[s
                         f'''
                         <div class="target-inline-item">
                           <img src="data:image/jpeg;base64,{image_to_base64_jpg(target["focus_bgr"])}" />
-                          <div>{target["label"]}<br/>{target["spec"].hex}</div>
+                          <div>{target["label"]}<br/>校验图: {target["spec"].hex}<br/>渲染色: {target.get("render_source_hex", target["spec"].hex)}</div>
                         </div>
                         '''
                         for target in targets
@@ -942,7 +1000,9 @@ def build_result_html(job_label: str, orig_bgr: np.ndarray, targets: list[dict[s
           <div>
             <strong>{target['label']}</strong><br/>
             类型 {target.get('style', 'normal')}<br/>
-            {target['spec'].hex}<br/>
+            校验图颜色 {target['spec'].hex}<br/>
+            渲染色来源 {target.get('render_source_kind', '校验模特图回退')}<br/>
+            渲染色 {target.get('render_source_hex', target['spec'].hex)}<br/>
             RGB {target['spec'].rgb}<br/>
             HSL {target['spec'].hsl}<br/>
             LAB {target['spec'].lab}
@@ -950,7 +1010,7 @@ def build_result_html(job_label: str, orig_bgr: np.ndarray, targets: list[dict[s
           <div class="target-images">
             <img src="data:image/jpeg;base64,{image_to_base64_jpg(target['image_bgr'])}" />
             <img src="data:image/jpeg;base64,{image_to_base64_jpg(target['focus_bgr'])}" />
-            <img src="data:image/jpeg;base64,{image_to_base64_jpg(target['chip_bgr'])}" />
+            <img src="data:image/jpeg;base64,{image_to_base64_jpg(target['render_source_chip_bgr'])}" />
           </div>
         </div>
         """
@@ -1218,7 +1278,7 @@ def select_reference_paths_for_styles() -> dict[str, Path]:
         img = read_image_path(path)
         if img is None:
             continue
-        analysis = analyze_reference_image(img, path.stem)
+        analysis = analyze_validation_reference_image(img, path.stem)
         style = analysis.get("style", "normal")
         fallback.append(path)
         if style not in selected:
@@ -1245,7 +1305,7 @@ def build_job_inputs(
     top_n: int = 3,
 ) -> dict[str, Any]:
     orig_bgr = ensure_bgr(orig_img)
-    targets = [analyze_reference_image(item["image"], item["label"]) for item in ref_inputs]
+    targets = [analyze_target_input(item) for item in ref_inputs]
     regions = []
     for index, region in enumerate(region_sources):
         mask_3d = preprocess_mask(region["mask_source"], orig_bgr.shape[:2])
@@ -1683,6 +1743,522 @@ def build_palette_ui() -> None:
                     )
         st.download_button("下载参考色 HTML", report["html"].encode("utf-8"), file_name="reference_palette.html", mime="text/html", use_container_width=True)
         st.download_button("下载参考色 JSON", report["json"].encode("utf-8"), file_name="reference_palette.json", mime="application/json", use_container_width=True)
+
+
+def create_layered_psd_bytes(job_label: str, orig_bgr: np.ndarray, best_combo: dict[str, Any], targets: list[dict[str, Any]], regions: list[dict[str, Any]]) -> bytes:
+    try:
+        from pytoshop import enums
+        from pytoshop.user import nested_layers
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(f"PSD dependency unavailable: {exc}") from exc
+
+    def rgb_channels(img_bgr: np.ndarray, alpha: np.ndarray | None = None) -> dict[int, np.ndarray]:
+        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        if alpha is None:
+            alpha = np.full(rgb.shape[:2], 255, dtype=np.uint8)
+        return {
+            0: rgb[:, :, 0].astype(np.uint8),
+            1: rgb[:, :, 1].astype(np.uint8),
+            2: rgb[:, :, 2].astype(np.uint8),
+            enums.ChannelId.transparency: alpha.astype(np.uint8),
+        }
+
+    h, w = orig_bgr.shape[:2]
+    reference_layers: list[Any] = []
+    for idx, target in enumerate(targets):
+        reference_layers.append(
+            nested_layers.Group(
+                name=f"{target['label']}_reference",
+                layers=[
+                    nested_layers.Image(
+                        name=f"{target['label']}_validation_source",
+                        top=0,
+                        left=0,
+                        channels=rgb_channels(target["image_bgr"]),
+                        color_mode=enums.ColorMode.rgb,
+                    ),
+                    nested_layers.Image(
+                        name=f"{target['label']}_validation_focus",
+                        top=0,
+                        left=0,
+                        channels=rgb_channels(target["focus_bgr"]),
+                        color_mode=enums.ColorMode.rgb,
+                    ),
+                    nested_layers.Image(
+                        name=f"{target['label']}_validation_chip",
+                        top=40 + idx * 140,
+                        left=40,
+                        channels=rgb_channels(target["chip_bgr"]),
+                        color_mode=enums.ColorMode.rgb,
+                    ),
+                    nested_layers.Image(
+                        name=f"{target['label']}_render_source",
+                        top=0,
+                        left=0,
+                        channels=rgb_channels(target["render_source_bgr"]),
+                        color_mode=enums.ColorMode.rgb,
+                    ),
+                    nested_layers.Image(
+                        name=f"{target['label']}_render_chip",
+                        top=40 + idx * 140,
+                        left=280,
+                        channels=rgb_channels(target["render_source_chip_bgr"]),
+                        color_mode=enums.ColorMode.rgb,
+                    ),
+                ],
+                closed=False,
+                visible=(idx == 0),
+            )
+        )
+
+    mask_layers: list[Any] = []
+    recolor_layers: list[Any] = [
+        nested_layers.Image(
+            name="final_composite",
+            top=0,
+            left=0,
+            channels=rgb_channels(best_combo["image"]),
+            color_mode=enums.ColorMode.rgb,
+        )
+    ]
+    for region in regions:
+        mask_alpha = np.clip(region["mask_3d"][:, :, 0] * 255.0, 0, 255).astype(np.uint8)
+        mask_preview = np.dstack([mask_alpha, mask_alpha, mask_alpha])
+        candidate = best_combo["candidate_map"][region["name"]]
+        recolor_layers.append(
+            nested_layers.Image(
+                name=f"{region['name']}_recolor",
+                top=0,
+                left=0,
+                channels=rgb_channels(candidate["image"], mask_alpha),
+                color_mode=enums.ColorMode.rgb,
+            )
+        )
+        mask_layers.append(
+            nested_layers.Image(
+                name=f"{region['name']}_mask_preview",
+                top=0,
+                left=0,
+                channels=rgb_channels(mask_preview),
+                color_mode=enums.ColorMode.rgb,
+            )
+        )
+
+    layer_stack: list[Any] = [
+        nested_layers.Group(name="reference_layers", layers=reference_layers, closed=False),
+        nested_layers.Group(name="mask_layers", layers=mask_layers, visible=False, closed=False),
+        nested_layers.Group(name="recolor_layers", layers=recolor_layers, closed=False),
+        nested_layers.Image(
+            name="original_base",
+            top=0,
+            left=0,
+            channels=rgb_channels(orig_bgr),
+            color_mode=enums.ColorMode.rgb,
+        ),
+    ]
+    psd = nested_layers.nested_layers_to_psd(
+        layer_stack,
+        color_mode=enums.ColorMode.rgb,
+        size=(h, w),
+        compression=enums.Compression.raw,
+    )
+    buffer = io.BytesIO()
+    psd.write(buffer)
+    return buffer.getvalue()
+
+
+def build_export_zip(result: dict[str, Any]) -> bytes:
+    if not result["combos"]:
+        return b""
+    best = result["combos"][0]
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        base = slugify(result["job_label"])
+        zf.writestr(
+            f"{base}/best.jpg",
+            image_to_bytes(best["image"], ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 100]),
+        )
+        zf.writestr(f"{base}/best.psd", result["psd_bytes"])
+        zf.writestr(f"{base}/report.html", result["html"].encode("utf-8"))
+        zf.writestr(
+            f"{base}/report.json",
+            json.dumps(result["payload"], ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+        for idx, target in enumerate(result["targets"], start=1):
+            prefix = f"{base}/references/{idx:02d}_{slugify(target['label'])}"
+            zf.writestr(f"{prefix}_validation_source.jpg", image_to_bytes(target["image_bgr"], ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 97]))
+            zf.writestr(f"{prefix}_validation_focus.jpg", image_to_bytes(target["focus_bgr"], ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 97]))
+            zf.writestr(f"{prefix}_validation_chip.jpg", image_to_bytes(target["chip_bgr"], ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 97]))
+            zf.writestr(f"{prefix}_render_source.jpg", image_to_bytes(target["render_source_bgr"], ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 97]))
+            zf.writestr(f"{prefix}_render_chip.jpg", image_to_bytes(target["render_source_chip_bgr"], ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 97]))
+    return buffer.getvalue()
+
+
+def analyze_reference_folder(reference_paths: list[Path] | None = None) -> dict[str, Any]:
+    paths = reference_paths or list_reference_paths()
+    rows = []
+    for path in paths:
+        img = read_image_path(path)
+        if img is None:
+            continue
+        analysis = analyze_validation_reference_image(img, path.stem)
+        rows.append(
+            {
+                "file_name": path.name,
+                "hex": analysis["spec"].hex,
+                "rgb": list(analysis["spec"].rgb),
+                "hsl": list(analysis["spec"].hsl),
+                "lab": list(analysis["spec"].lab),
+                "css": analysis["spec"].css,
+                "style": analysis["style"],
+                "chip_jpg": image_to_base64_jpg(analysis["chip_bgr"]),
+                "source_jpg": image_to_base64_jpg(analysis["image_bgr"]),
+                "focus_jpg": image_to_base64_jpg(analysis["focus_bgr"]),
+            }
+        )
+    html_rows = "".join(
+        f"""
+        <tr>
+          <td>{row['file_name']}</td>
+          <td>
+            <div style="display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:10px;align-items:start;">
+              <figure style="margin:0;">
+                <img src="data:image/jpeg;base64,{row['source_jpg']}" style="width:100%;border-radius:10px;border:1px solid #d8cdbd;" />
+                <figcaption style="margin-top:6px;font-size:12px;color:#475569;">原始模特图</figcaption>
+              </figure>
+              <figure style="margin:0;">
+                <img src="data:image/jpeg;base64,{row['focus_jpg']}" style="width:100%;border-radius:10px;border:1px solid #d8cdbd;" />
+                <figcaption style="margin-top:6px;font-size:12px;color:#475569;">提取区域预览</figcaption>
+              </figure>
+              <figure style="margin:0;">
+                <img src="data:image/jpeg;base64,{row['chip_jpg']}" style="width:100%;border-radius:10px;border:1px solid #d8cdbd;" />
+                <figcaption style="margin-top:6px;font-size:12px;color:#475569;">校验图色卡</figcaption>
+              </figure>
+            </div>
+          </td>
+          <td>{row['hex']}</td>
+          <td>{tuple(row['rgb'])}</td>
+          <td>{tuple(row['hsl'])}</td>
+          <td>{tuple(round(v, 2) for v in row['lab'])}</td>
+          <td>{row['style']}</td>
+          <td><code>{row['css']}</code></td>
+        </tr>
+        """
+        for row in rows
+    )
+    html = f"""
+    <!doctype html>
+    <html lang="zh-CN">
+    <head>
+      <meta charset="utf-8" />
+      <title>颜色参考目录分析</title>
+      <style>
+        body {{ font-family: "Segoe UI", "PingFang SC", sans-serif; margin: 24px; background: #f7f3ed; color: #1f2937; }}
+        table {{ width: 100%; border-collapse: collapse; background: white; border-radius: 16px; overflow: hidden; }}
+        th, td {{ padding: 12px 14px; border-bottom: 1px solid #eadfce; text-align: left; vertical-align: top; }}
+        th {{ background: #163547; color: #f8fafc; }}
+        code {{ white-space: normal; }}
+      </style>
+    </head>
+    <body>
+      <h1>颜色参考目录分析</h1>
+      <p>建议同时保存 HEX 和 CIELAB。HEX 适合页面展示和系统录入，LAB 更适合未来的色差计算与自动调色。</p>
+      <table>
+        <thead>
+          <tr>
+            <th>文件</th>
+            <th>对比图</th>
+            <th>HEX</th>
+            <th>RGB</th>
+            <th>HSL</th>
+            <th>LAB</th>
+            <th>分类</th>
+            <th>推荐 CSS</th>
+          </tr>
+        </thead>
+        <tbody>{html_rows}</tbody>
+      </table>
+    </body>
+    </html>
+    """
+    return {"rows": rows, "html": html, "json": json.dumps(rows, ensure_ascii=False, indent=2)}
+
+
+def run_demo_batch_tests(max_cases: int = 6) -> dict[str, Any]:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    if not available_sample_names():
+        raise ValueError("No local sample folders available for batch testing.")
+    style_refs = select_reference_paths_for_styles()
+    required_styles = {"white", "light", "dark", "neon"}
+    if not required_styles.issubset(style_refs.keys()):
+        raise ValueError("Reference images are missing for one or more required style categories.")
+    cases = [
+        ("C_白色_一件套", "C", [style_refs["white"]], [0], ["white"]),
+        ("C_深色_一件套", "C", [style_refs["dark"]], [0], ["dark"]),
+        ("A_深色_同色", "A", [style_refs["dark"]], [0, 0], ["dark"]),
+        ("A_荧光_浅色_异色", "A", [style_refs["neon"], style_refs["light"]], [0, 1], ["neon", "light"]),
+        ("B_浅色_同色", "B", [style_refs["light"]], [0, 0], ["light"]),
+        ("B_深色_荧光_异色", "B", [style_refs["dark"], style_refs["neon"]], [0, 1], ["dark", "neon"]),
+    ][:max_cases]
+    summaries = []
+    report_rows = []
+    for label, sample_name, ref_selection, region_map, styles in cases:
+        sample = discover_sample_bundle(sample_name)
+        ref_inputs = [{"label": path.stem, "validation_image": read_image_path(path), "render_image": None} for path in ref_selection]
+        result = build_job_inputs(label, sample["orig_img"], sample["region_sources"], ref_inputs, region_map, top_n=3)
+        case_dir = OUTPUT_DIR / slugify(label)
+        cleanup_legacy_pngs(case_dir)
+        best = result["combos"][0]
+        jpg_path = save_bytes(case_dir / "best.jpg", image_to_bytes(best["image"], ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 100]))
+        psd_path = save_bytes(case_dir / "best.psd", result["psd_bytes"])
+        json_path = save_bytes(case_dir / "report.json", json.dumps(result["payload"], ensure_ascii=False, indent=2).encode("utf-8"))
+        html_path = save_bytes(case_dir / "report.html", result["html"].encode("utf-8"))
+        zip_path = save_bytes(case_dir / "export_bundle.zip", build_export_zip(result))
+        refs_dir = case_dir / "references"
+        for idx, target in enumerate(result["targets"], start=1):
+            prefix = refs_dir / f"{idx:02d}_{slugify(target['label'])}"
+            save_bytes(prefix.with_name(prefix.name + "_validation_source.jpg"), image_to_bytes(target["image_bgr"], ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 97]))
+            save_bytes(prefix.with_name(prefix.name + "_validation_focus.jpg"), image_to_bytes(target["focus_bgr"], ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 97]))
+            save_bytes(prefix.with_name(prefix.name + "_validation_chip.jpg"), image_to_bytes(target["chip_bgr"], ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 97]))
+            save_bytes(prefix.with_name(prefix.name + "_render_source.jpg"), image_to_bytes(target["render_source_bgr"], ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 97]))
+            save_bytes(prefix.with_name(prefix.name + "_render_chip.jpg"), image_to_bytes(target["render_source_chip_bgr"], ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 97]))
+        summaries.append(
+            {
+                "label": label,
+                "styles": ", ".join(styles),
+                "best_de": round(float(best["de"]), 4),
+                "jpg_path": str(jpg_path),
+                "psd_path": str(psd_path),
+                "zip_path": str(zip_path),
+                "json_path": str(json_path),
+                "html_path": str(html_path),
+            }
+        )
+        report_rows.append(
+            f"""
+            <section class="card">
+              <h2>{label}</h2>
+              <p><strong>测试分类:</strong> {", ".join(styles)}</p>
+              <p><strong>最佳 DeltaE:</strong> {best['de']:.2f}</p>
+              <p>
+                <a href="{jpg_path.name}">JPG</a> |
+                <a href="{psd_path.name}">PSD</a> |
+                <a href="{zip_path.name}">导出包 ZIP</a> |
+                <a href="{json_path.name}">JSON</a>
+              </p>
+              <img src="data:image/jpeg;base64,{image_to_base64_jpg(best['image'])}" />
+            </section>
+            """
+        )
+        gc.collect()
+    palette_report = analyze_reference_folder()
+    palette_dir = OUTPUT_DIR / "reference_palette"
+    cleanup_legacy_pngs(palette_dir)
+    palette_html_path = save_bytes(palette_dir / "palette.html", palette_report["html"].encode("utf-8"))
+    palette_json_path = save_bytes(palette_dir / "palette.json", palette_report["json"].encode("utf-8"))
+    summary_html = f"""
+    <!doctype html>
+    <html lang="zh-CN">
+    <head>
+      <meta charset="utf-8" />
+      <title>批量调色测试报告</title>
+      <style>
+        body {{ font-family: "Segoe UI", "PingFang SC", sans-serif; margin: 24px; background: #f3efe7; color: #1e293b; }}
+        .card {{ background: white; border-radius: 18px; padding: 18px; border: 1px solid #e4d6c4; margin-bottom: 18px; }}
+        img {{ max-width: 100%; border-radius: 12px; border: 1px solid #eadfce; }}
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>批量调色测试报告</h1>
+        <p>覆盖一件套、两件套、同色、异色，以及 white/light/dark/neon 分类。</p>
+        <p><a href="reference_palette/palette.html">颜色参考目录 HTML</a> | <a href="reference_palette/palette.json">颜色参考目录 JSON</a></p>
+      </div>
+      {''.join(report_rows)}
+    </body>
+    </html>
+    """
+    summary_path = save_bytes(OUTPUT_DIR / "batch_test_summary.html", summary_html.encode("utf-8"))
+    return {
+        "cases": summaries,
+        "report_path": str(summary_path),
+        "palette_html_path": str(palette_html_path),
+        "palette_json_path": str(palette_json_path),
+    }
+
+
+def render_color_summary(targets: list[dict[str, Any]]) -> None:
+    cols = st.columns(max(1, len(targets)))
+    for col, target in zip(cols, targets):
+        with col:
+            chip_cols = st.columns(2)
+            with chip_cols[0]:
+                st.image(cv2.cvtColor(target["chip_bgr"], cv2.COLOR_BGR2RGB), caption=f"{target['label']} 校验图颜色", use_container_width=True)
+            with chip_cols[1]:
+                st.image(cv2.cvtColor(target["render_source_chip_bgr"], cv2.COLOR_BGR2RGB), caption=f"{target['label']} 渲染色", use_container_width=True)
+            st.code(
+                "\n".join(
+                    [
+                        f"校验图 HEX: {target['spec'].hex}",
+                        f"渲染色来源: {target.get('render_source_kind', '校验模特图回退')}",
+                        f"渲染色 HEX: {target.get('render_source_hex', target['spec'].hex)}",
+                        f"RGB: {target['spec'].rgb}",
+                        f"HSL: {target['spec'].hsl}",
+                        f"LAB: {target['spec'].lab}",
+                    ]
+                ),
+                language="text",
+            )
+
+
+def build_single_job_ui() -> None:
+    st.subheader("单次调色")
+    st.caption("每个颜色分成两张参考图: 校验图必传, 纯色色块图可选。不上传纯色色块时, 会自动回退使用校验图提取渲染色。")
+    sample_names = available_sample_names()
+    has_local_samples = bool(sample_names)
+    source_options = ["本地样例", "手动上传"] if has_local_samples else ["手动上传"]
+    source_mode = st.radio("输入方式", source_options, horizontal=True)
+    if not has_local_samples:
+        st.info("当前环境没有内置样例目录, 已自动切换到手动上传模式。")
+
+    sample_name = "manual"
+    if source_mode == "本地样例" and has_local_samples:
+        sample_name = st.selectbox("选择样例", sample_names)
+        try:
+            sample = discover_sample_bundle(sample_name)
+        except FileNotFoundError:
+            st.warning("本地样例资源不存在, 已切换为手动上传模式。")
+            source_mode = "手动上传"
+            sample = None
+        if sample is not None:
+            region_count = sample["region_count"]
+            orig_img = sample["orig_img"]
+            region_sources = sample["region_sources"]
+        else:
+            region_count = st.radio("套装区域数", [1, 2], horizontal=True, format_func=lambda value: "一件套" if value == 1 else "两件套")
+            orig_file = st.file_uploader("上传原图", type=["jpg", "jpeg", "png"])
+            orig_img = load_uploaded_image(orig_file)
+            region_sources = []
+            if region_count == 1:
+                mask_file = st.file_uploader("上传主体蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="mask_one_fallback")
+                region_sources.append({"name": "主体", "mask_source": load_uploaded_image(mask_file)})
+            else:
+                top_file = st.file_uploader("上传上衣蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="mask_top_fallback")
+                bottom_file = st.file_uploader("上传底裤蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="mask_bottom_fallback")
+                region_sources.extend(
+                    [
+                        {"name": "上衣", "mask_source": load_uploaded_image(top_file)},
+                        {"name": "底裤", "mask_source": load_uploaded_image(bottom_file)},
+                    ]
+                )
+    else:
+        region_count = st.radio("套装区域数", [1, 2], horizontal=True, format_func=lambda value: "一件套" if value == 1 else "两件套")
+        orig_file = st.file_uploader("上传原图", type=["jpg", "jpeg", "png"])
+        orig_img = load_uploaded_image(orig_file)
+        region_sources = []
+        if region_count == 1:
+            mask_file = st.file_uploader("上传主体蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="mask_one")
+            region_sources.append({"name": "主体", "mask_source": load_uploaded_image(mask_file)})
+        else:
+            top_file = st.file_uploader("上传上衣蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="mask_top")
+            bottom_file = st.file_uploader("上传底裤蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="mask_bottom")
+            region_sources.extend(
+                [
+                    {"name": "上衣", "mask_source": load_uploaded_image(top_file)},
+                    {"name": "底裤", "mask_source": load_uploaded_image(bottom_file)},
+                ]
+            )
+
+    color_count = 1 if region_count == 1 else st.radio("调色数量", [1, 2], horizontal=True, format_func=lambda value: "同一颜色" if value == 1 else "两个颜色")
+    ref_paths = list_reference_paths() if source_mode == "本地样例" else []
+    if source_mode == "本地样例" and not ref_paths:
+        st.info("当前环境没有内置颜色参考目录, 请改用上传校验图。")
+
+    ref_inputs: list[dict[str, Any]] = []
+    ref_name_map = {path.name: path for path in ref_paths}
+    ref_name_options = list(ref_name_map.keys())
+    st.markdown("**颜色参考图**")
+    st.caption("带模特校验图用于计算 DeltaE。纯色色块图只用于定义目标渲染色，不传也可以先跑。")
+    for idx in range(color_count):
+        label_default = f"颜色 {idx + 1}"
+        with st.container(border=True):
+            st.markdown(f"**{label_default}**")
+            if source_mode == "本地样例" and ref_name_options:
+                default_index = min(idx, len(ref_name_options) - 1)
+                validation_name = st.selectbox(
+                    f"{label_default} 选择带模特校验图",
+                    ref_name_options,
+                    index=default_index,
+                    key=f"validation_ref_{idx}",
+                )
+                validation_path = ref_name_map[validation_name]
+                validation_image = read_image_path(validation_path)
+                label = validation_path.stem
+            else:
+                validation_file = st.file_uploader(
+                    f"{label_default} 上传带模特校验图（必传）",
+                    type=["jpg", "jpeg", "png"],
+                    key=f"validation_upload_{idx}",
+                )
+                validation_image = load_uploaded_image(validation_file)
+                label = Path(validation_file.name).stem if validation_file is not None else label_default
+            render_file = st.file_uploader(
+                f"{label_default} 上传纯色色块图（可选）",
+                type=["jpg", "jpeg", "png"],
+                key=f"render_upload_{idx}",
+            )
+            render_image = load_uploaded_image(render_file)
+            if render_image is None:
+                st.caption("未上传纯色色块图时，会回退使用校验图提取渲染色。")
+            ref_inputs.append(
+                {
+                    "label": label,
+                    "validation_image": validation_image,
+                    "render_image": render_image,
+                }
+            )
+
+    if region_count == 1:
+        region_map = [0]
+    elif color_count == 1:
+        region_map = [0, 0]
+    else:
+        region_map = [0, 1]
+
+    if st.button("开始调色并寻找最小 DeltaE", use_container_width=True):
+        if orig_img is None:
+            st.error("请先提供原图。")
+            return
+        if any(item["mask_source"] is None for item in region_sources):
+            st.error("请先提供所有区域的蒙版或对齐白底图。")
+            return
+        if any(item["validation_image"] is None for item in ref_inputs):
+            st.error("请先提供每个颜色的带模特校验图。")
+            return
+        with st.spinner("正在按“校验图算 DeltaE、纯色色块图优先定渲染色”的逻辑搜索最佳结果..."):
+            result = build_job_inputs(
+                "手动调色任务" if source_mode == "手动上传" else f"{sample_name}_调色任务",
+                orig_img,
+                region_sources,
+                ref_inputs,
+                region_map,
+                top_n=3,
+            )
+        st.success(f"已完成，共生成 {len(result['combos'])} 组候选结果。")
+        render_color_summary(result["targets"])
+        render_result_downloads(result)
+        if result["combos"]:
+            cols = st.columns(len(result["combos"]))
+            for idx, combo in enumerate(result["combos"]):
+                with cols[idx]:
+                    st.image(cv2.cvtColor(combo["image"], cv2.COLOR_BGR2RGB), caption=f"候选 {idx + 1} | DeltaE {combo['de']:.2f}", use_container_width=True)
+                    st.json(
+                        {
+                            "region_delta_e": {name: round(float(value), 3) for name, value in combo["region_de"].items()},
+                            "harmony_penalty": round(float(combo.get("harmony_penalty", 0.0)), 3),
+                            "same_color_pairs": {name: round(float(value), 3) for name, value in combo.get("harmony_pairs", {}).items()},
+                        }
+                    )
 
 
 def main() -> None:
