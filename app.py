@@ -314,6 +314,11 @@ def white_color_strength(target_lab: np.ndarray) -> float:
     return float(light_factor * chroma_factor)
 
 
+def bright_flat_strength(target_lab: np.ndarray) -> float:
+    l_t = float(target_lab[0])
+    return float(np.clip((l_t - 178.0) / 44.0, 0.0, 1.0))
+
+
 def neon_color_strength(target_lab: np.ndarray) -> float:
     _, a_t, b_t = target_lab.astype(float)
     chroma = float(np.linalg.norm([a_t - 128.0, b_t - 128.0]))
@@ -322,6 +327,7 @@ def neon_color_strength(target_lab: np.ndarray) -> float:
 
 def classify_target_style(target_lab: np.ndarray) -> str:
     white_strength = white_color_strength(target_lab)
+    bright_strength = bright_flat_strength(target_lab)
     pale_strength = pale_color_strength(target_lab)
     dark_strength = dark_color_strength(target_lab)
     neon_strength = neon_color_strength(target_lab)
@@ -449,6 +455,8 @@ def render_standard(orig_img: np.ndarray, gray_img: np.ndarray, mask_3d: np.ndar
     pale_strength = pale_color_strength(target_lab)
     dark_strength = dark_color_strength(target_lab)
     white_strength = white_color_strength(target_lab)
+    bright_strength = bright_flat_strength(target_lab)
+    bright_strength = bright_flat_strength(target_lab)
     denoise_d = 3 if dark_strength > 0.35 else (7 if pale_strength >= 0.2 else 5)
     sigma_color = 16 + int(round(30 * pale_strength - 4 * dark_strength + 18 * white_strength))
     sigma_space = 16 + int(round(22 * pale_strength - 4 * dark_strength + 16 * white_strength))
@@ -553,15 +561,27 @@ def render_neon(orig_img: np.ndarray, mask_3d: np.ndarray, target_lab: np.ndarra
     l_off, a_off, b_off, detail_gain = params
     l_t, a_t, b_t = target_lab.astype(float)
     gray = cv2.cvtColor(orig_img, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    gray_detail = clahe.apply(gray).astype(np.float32) / 255.0
+    denoised_gray = cv2.bilateralFilter(gray, d=7, sigmaColor=18, sigmaSpace=18)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray_detail = clahe.apply(denoised_gray).astype(np.float32) / 255.0
     mask_bool = mask_3d[:, :, 0] > 0.08
     avg_detail = float(np.mean(gray_detail[mask_bool])) if np.any(mask_bool) else 0.5
     detail_map = gray_detail - avg_detail
+    detail_abs = np.abs(detail_map)
+    detail_scale = float(np.percentile(detail_abs[mask_bool], 88)) + 1e-6 if np.any(mask_bool) else 1.0
+    grad_x = cv2.Sobel(denoised_gray.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(denoised_gray.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = cv2.magnitude(grad_x, grad_y)
+    grad_scale = float(np.percentile(grad_mag[mask_bool], 88)) + 1e-6 if np.any(mask_bool) else 1.0
+    structure_mask = np.clip((detail_abs / detail_scale) * 0.56 + (grad_mag / grad_scale) * 0.44, 0.0, 1.0)
+    structure_mask = cv2.GaussianBlur(structure_mask, (7, 7), 0)
+    bright_strength = bright_flat_strength(target_lab)
+    flat_mask = np.clip(mask_3d[:, :, 0] * (1.0 - np.clip(structure_mask, 0.0, 1.0)), 0.0, 1.0)
+    detail_gain_effective = detail_gain * (0.72 - 0.34 * bright_strength)
     target_l = np.clip(l_t + l_off, 0, 255)
     target_a = np.clip(a_t + a_off, 0, 255)
     target_b = np.clip(b_t + b_off, 0, 255)
-    l_layer = np.clip(np.full(gray.shape, target_l, dtype=np.float32) + (detail_map * detail_gain), 0, 255)
+    l_layer = np.clip(np.full(gray.shape, target_l, dtype=np.float32) + (detail_map * detail_gain_effective), 0, 255)
     final_lab = cv2.merge(
         [
             l_layer.astype(np.uint8),
@@ -570,8 +590,12 @@ def render_neon(orig_img: np.ndarray, mask_3d: np.ndarray, target_lab: np.ndarra
         ]
     )
     res_bgr = cv2.cvtColor(final_lab, cv2.COLOR_LAB2BGR)
-    gaussian = cv2.GaussianBlur(res_bgr, (0, 0), 2)
-    res_bgr = cv2.addWeighted(res_bgr, 1.4, gaussian, -0.4, 0)
+    smooth = cv2.bilateralFilter(res_bgr, d=9, sigmaColor=28 + int(round(12 * bright_strength)), sigmaSpace=24 + int(round(10 * bright_strength)))
+    smooth = cv2.GaussianBlur(smooth, (0, 0), 0.9 + 0.8 * bright_strength)
+    smooth_alpha = np.clip(flat_mask * (0.22 + 0.42 * bright_strength), 0.0, 1.0)
+    res_bgr = blend_with_alpha(res_bgr, smooth, smooth_alpha)
+    if bright_strength > 0.05:
+        res_bgr = cleanup_vivid_flat_noise(res_bgr, flat_mask, structure_mask, bright_strength)
     final_out = res_bgr.astype(np.float32) * mask_3d + orig_img.astype(np.float32) * (1.0 - mask_3d)
     return np.clip(final_out, 0, 255).astype(np.uint8)
 
@@ -2288,12 +2312,91 @@ def cleanup_dark_flat_noise(result_bgr: np.ndarray, flat_mask: np.ndarray, struc
     return cv2.cvtColor(np.clip(lab, 0.0, 255.0).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
+def cleanup_light_flat_noise(
+    result_bgr: np.ndarray,
+    flat_mask: np.ndarray,
+    structure_mask: np.ndarray,
+    pale_strength: float,
+    white_strength: float,
+) -> np.ndarray:
+    strength = max(float(pale_strength), float(white_strength) * 0.9)
+    if strength <= 0.03:
+        return result_bgr
+    nlm = cv2.fastNlMeansDenoisingColored(
+        result_bgr,
+        None,
+        h=max(4, int(round(5 + 8 * strength))),
+        hColor=max(5, int(round(7 + 10 * strength))),
+        templateWindowSize=7,
+        searchWindowSize=21,
+    )
+    lab = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l_channel = lab[:, :, 0].astype(np.uint8)
+    ab = lab[:, :, 1:].astype(np.uint8)
+    low_l = cv2.resize(l_channel, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    low_l = cv2.GaussianBlur(low_l, (0, 0), 1.2 + 1.0 * strength)
+    smooth_l = cv2.resize(low_l, (l_channel.shape[1], l_channel.shape[0]), interpolation=cv2.INTER_CUBIC)
+    smooth_ab = cv2.GaussianBlur(ab, (0, 0), 1.0 + 1.15 * strength)
+    local_noise = cv2.absdiff(l_channel, cv2.GaussianBlur(l_channel, (0, 0), 0.9))
+    noise_boost = 0.0
+    flat_bool = flat_mask > 0.08
+    if np.any(flat_bool):
+        noise_level = float(np.percentile(local_noise[flat_bool], 84))
+        noise_boost = float(np.clip((noise_level - 1.8) / 6.0, 0.0, 1.0))
+    preserve = 1.0 - 0.68 * np.clip(structure_mask, 0.0, 1.0)
+    l_alpha = np.clip(flat_mask * (0.16 + 0.34 * strength + 0.22 * noise_boost) * preserve, 0.0, 1.0)
+    ab_alpha = np.clip(flat_mask * (0.24 + 0.40 * strength + 0.24 * noise_boost) * preserve, 0.0, 1.0)
+    lab[:, :, 0] = lab[:, :, 0] * (1.0 - l_alpha) + smooth_l.astype(np.float32) * l_alpha
+    lab[:, :, 1] = lab[:, :, 1] * (1.0 - ab_alpha) + smooth_ab[:, :, 0].astype(np.float32) * ab_alpha
+    lab[:, :, 2] = lab[:, :, 2] * (1.0 - ab_alpha) + smooth_ab[:, :, 1].astype(np.float32) * ab_alpha
+    cleaned = cv2.cvtColor(np.clip(lab, 0.0, 255.0).astype(np.uint8), cv2.COLOR_LAB2BGR)
+    flat_smooth = cv2.bilateralFilter(
+        cleaned,
+        d=9,
+        sigmaColor=22 + int(round(18 * strength + 16 * noise_boost)),
+        sigmaSpace=18 + int(round(16 * strength + 14 * noise_boost)),
+    )
+    flat_smooth = cv2.GaussianBlur(flat_smooth, (0, 0), 0.9 + 0.9 * strength)
+    macro_low = cv2.resize(cleaned, None, fx=0.35, fy=0.35, interpolation=cv2.INTER_AREA)
+    macro_low = cv2.GaussianBlur(macro_low, (0, 0), 1.1 + 1.4 * strength)
+    macro_smooth = cv2.resize(macro_low, (cleaned.shape[1], cleaned.shape[0]), interpolation=cv2.INTER_CUBIC)
+    nlm_alpha = np.clip(flat_mask * (0.08 + 0.26 * strength + 0.22 * noise_boost) * preserve, 0.0, 1.0)
+    cleaned = blend_with_alpha(cleaned, nlm, nlm_alpha)
+    flat_alpha = np.clip(flat_mask * (0.18 + 0.52 * strength + 0.30 * noise_boost) * preserve, 0.0, 1.0)
+    cleaned = blend_with_alpha(cleaned, flat_smooth, flat_alpha)
+    macro_alpha = np.clip(flat_mask * (0.10 + 0.42 * strength + 0.24 * noise_boost) * (1.0 - 0.78 * np.clip(structure_mask, 0.0, 1.0)), 0.0, 1.0)
+    return blend_with_alpha(cleaned, macro_smooth, macro_alpha)
+
+
+def cleanup_vivid_flat_noise(
+    result_bgr: np.ndarray,
+    flat_mask: np.ndarray,
+    structure_mask: np.ndarray,
+    strength: float,
+) -> np.ndarray:
+    if strength <= 0.03:
+        return result_bgr
+    smooth = cv2.bilateralFilter(
+        result_bgr,
+        d=9,
+        sigmaColor=20 + int(round(16 * strength)),
+        sigmaSpace=18 + int(round(14 * strength)),
+    )
+    low = cv2.resize(smooth, None, fx=0.4, fy=0.4, interpolation=cv2.INTER_AREA)
+    low = cv2.GaussianBlur(low, (0, 0), 1.0 + 1.2 * strength)
+    macro = cv2.resize(low, (result_bgr.shape[1], result_bgr.shape[0]), interpolation=cv2.INTER_CUBIC)
+    preserve = 1.0 - 0.76 * np.clip(structure_mask, 0.0, 1.0)
+    alpha = np.clip(flat_mask * (0.18 + 0.46 * strength) * preserve, 0.0, 1.0)
+    return blend_with_alpha(result_bgr, macro, alpha)
+
+
 def render_standard(orig_img: np.ndarray, gray_img: np.ndarray, mask_3d: np.ndarray, target_lab: np.ndarray, params: tuple[float, float, float, float, float]) -> np.ndarray:
     gamma, l_off, a_off, b_off, detail_boost = params
     l_t, a_t, b_t = target_lab.astype(float)
     pale_strength = pale_color_strength(target_lab)
     dark_strength = dark_color_strength(target_lab)
     white_strength = white_color_strength(target_lab)
+    bright_strength = bright_flat_strength(target_lab)
     denoise_d = 3 if dark_strength > 0.35 else (7 if pale_strength >= 0.2 else 5)
     sigma_color = 16 + int(round(30 * pale_strength - 4 * dark_strength + 18 * white_strength))
     sigma_space = 16 + int(round(22 * pale_strength - 4 * dark_strength + 16 * white_strength))
@@ -2301,7 +2404,7 @@ def render_standard(orig_img: np.ndarray, gray_img: np.ndarray, mask_3d: np.ndar
     sigma_space = max(10, sigma_space)
     denoised_gray = cv2.bilateralFilter(gray_img, d=denoise_d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
     blur_layer = cv2.GaussianBlur(denoised_gray, (15, 15), 0)
-    detail_gain = detail_boost * (1.0 - 0.60 * pale_strength - 0.24 * white_strength - 0.12 * dark_strength)
+    detail_gain = detail_boost * (1.0 - 0.90 * pale_strength - 0.42 * white_strength - 0.12 * dark_strength)
     detail_layer = cv2.subtract(denoised_gray, blur_layer).astype(np.float32) * detail_gain
     img_norm = denoised_gray.astype(np.float32) / 255.0
     img_gamma = np.power(img_norm + 1e-7, 1.0 / max(gamma, 0.01))
@@ -2363,6 +2466,14 @@ def render_standard(orig_img: np.ndarray, gray_img: np.ndarray, mask_3d: np.ndar
         dark_alpha = np.clip(flat_mask * (0.16 + 0.42 * dark_strength), 0.0, 1.0)
         result_bgr = blend_with_alpha(result_bgr, dark_smooth, dark_alpha)
         result_bgr = cleanup_dark_flat_noise(result_bgr, flat_mask, structure_mask, dark_strength)
+    if pale_strength > 0.03 or white_strength > 0.03 or bright_strength > 0.03:
+        result_bgr = cleanup_light_flat_noise(
+            result_bgr,
+            flat_mask,
+            structure_mask,
+            max(pale_strength, bright_strength),
+            white_strength,
+        )
     if pale_strength > 0.01:
         smooth_result = cv2.bilateralFilter(
             result_bgr,
@@ -2501,58 +2612,59 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
         }}
         .shell {{
           display: grid;
-          gap: 12px;
-          padding: 6px 4px 12px;
+          gap: 10px;
+          padding: 0;
         }}
         .refs-panel {{
           background: #fffdf9;
           border: 1px solid #e3d7c6;
           border-radius: 16px;
-          padding: 12px;
+          padding: 10px;
         }}
         .refs-title {{
-          font-size: 14px;
+          font-size: 13px;
           font-weight: 700;
-          margin-bottom: 10px;
+          margin-bottom: 8px;
         }}
         .refs-grid {{
           display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-          gap: 10px;
+          grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+          gap: 8px;
         }}
         .gallery-title {{
-          font-size: 14px;
+          font-size: 13px;
           font-weight: 700;
           padding: 0 2px;
         }}
         .gallery {{
           display: flex;
-          gap: 12px;
+          gap: 10px;
           overflow-x: auto;
-          padding: 4px 2px 12px;
+          padding: 2px 0 2px;
           cursor: grab;
           scroll-behavior: smooth;
+          scrollbar-width: thin;
         }}
         .gallery.dragging {{
           cursor: grabbing;
           user-select: none;
         }}
         .candidate-card {{
-          flex: 0 0 220px;
+          flex: 0 0 180px;
           background: #fffdf9;
           border: 1px solid #e3d7c6;
-          border-radius: 16px;
+          border-radius: 14px;
           overflow: hidden;
-          box-shadow: 0 10px 24px rgba(77, 54, 26, 0.08);
+          box-shadow: 0 8px 18px rgba(77, 54, 26, 0.08);
         }}
         .candidate-head {{
-          padding: 12px 12px 4px;
-          font-size: 14px;
+          padding: 10px 10px 2px;
+          font-size: 13px;
           font-weight: 700;
         }}
         .candidate-meta {{
-          padding: 0 12px 8px;
-          font-size: 13px;
+          padding: 0 10px 6px;
+          font-size: 12px;
           color: #64748b;
         }}
         .ref-item {{
@@ -2567,7 +2679,7 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
           margin-bottom: 6px;
         }}
         .result-wrap {{
-          padding: 0 10px 10px;
+          padding: 0 8px 8px;
         }}
         img {{
           width: 100%;
@@ -2578,10 +2690,10 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
           background: #ffffff;
         }}
         .refs-panel img {{
-          max-height: 180px;
+          max-height: 120px;
         }}
         .candidate-card img {{
-          max-height: 280px;
+          max-height: 190px;
         }}
       </style>
     </head>
@@ -2624,18 +2736,14 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
     </body>
     </html>
     """
-    components.html(html, height=560, scrolling=False)
+    components.html(html, height=360, scrolling=False)
 
 
 def build_single_job_ui() -> None:
-    st.subheader("单次调色")
-    st.caption("每个颜色分成两张参考图：带模特校验图必传，纯色色块图可选。不上传纯色色块时，会自动回退使用校验图提取渲染色。")
     sample_names = available_sample_names()
     has_local_samples = bool(sample_names)
     source_options = ["本地样例", "手动上传"] if has_local_samples else ["手动上传"]
     source_mode = st.radio("输入方式", source_options, horizontal=True)
-    if not has_local_samples:
-        st.info("当前环境没有内置样例目录，已自动切换到手动上传模式。")
 
     sample_name = "manual"
     if source_mode == "本地样例" and has_local_samples:
@@ -2687,14 +2795,12 @@ def build_single_job_ui() -> None:
 
     color_count = 1 if region_count == 1 else st.radio("调色数量", [1, 2], horizontal=True, format_func=lambda value: "同一颜色" if value == 1 else "两个颜色")
     ref_paths = list_reference_paths() if source_mode == "本地样例" else []
-    if source_mode == "本地样例" and not ref_paths:
-        st.info("当前环境没有内置颜色参考目录，请改用上传校验图。")
 
     ref_inputs: list[dict[str, Any]] = []
     ref_name_map = {path.name: path for path in ref_paths}
     ref_name_options = list(ref_name_map.keys())
-    st.markdown("**颜色参考图**")
-    st.caption("带模特校验图用于计算 DeltaE。纯色色块图只用于定义目标渲染色，不传也可以先跑。")
+    if source_mode == "本地样例" and not ref_paths:
+        source_mode = "手动上传"
     for idx in range(color_count):
         label_default = f"颜色 {idx + 1}"
         with st.container(border=True):
@@ -2724,8 +2830,6 @@ def build_single_job_ui() -> None:
                 key=f"render_upload_{idx}",
             )
             render_image = load_uploaded_image(render_file)
-            if render_image is None:
-                st.caption("未上传纯色色块图时，会回退使用校验图提取渲染色。")
             ref_inputs.append(
                 {
                     "label": label,
@@ -3179,16 +3283,9 @@ def build_job_inputs(
 
 
 def main() -> None:
-    st.set_page_config(page_title="智能调色与最小 DeltaE 优化", layout="wide")
+    st.set_page_config(page_title="智能泳衣调色工具", layout="wide")
     st.title("智能泳衣调色工具")
-    st.markdown("支持一件套 / 两件套、多区域同色或异色调色，自动寻找 **DeltaE 最小** 的结果，并导出分层 PSD 方便人工继续微调。")
-    tab_single, tab_batch, tab_palette = st.tabs(["单次调色", "本地批量测试", "参考色目录"])
-    with tab_single:
-        build_single_job_ui()
-    with tab_batch:
-        build_batch_ui()
-    with tab_palette:
-        build_palette_ui()
+    build_single_job_ui()
 
 
 if __name__ == "__main__":
