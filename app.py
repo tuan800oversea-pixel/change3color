@@ -2641,17 +2641,18 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
           display: flex;
           gap: 10px;
           overflow-x: auto;
-          padding: 2px 0 2px;
+          padding: 2px 0 8px;
           cursor: grab;
           scroll-behavior: smooth;
           scrollbar-width: thin;
+          align-items: flex-start;
         }}
         .gallery.dragging {{
           cursor: grabbing;
           user-select: none;
         }}
         .candidate-card {{
-          flex: 0 0 176px;
+          flex: 0 0 152px;
           background: #fffdf9;
           border: 1px solid #e3d7c6;
           border-radius: 14px;
@@ -2673,7 +2674,7 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
           border: 1px solid #eadfce;
           border-radius: 12px;
           padding: 8px;
-          width: 176px;
+          width: 152px;
           box-sizing: border-box;
         }}
         .ref-title {{
@@ -2683,6 +2684,10 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
         }}
         .result-wrap {{
           padding: 0 8px 10px;
+          height: 250px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
         }}
         img {{
           width: 100%;
@@ -2693,10 +2698,13 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
           background: #ffffff;
         }}
         .refs-panel img {{
-          height: 138px;
+          height: 126px;
+          object-fit: contain;
         }}
         .candidate-card img {{
-          max-height: 220px;
+          width: 100%;
+          height: 234px;
+          object-fit: contain;
         }}
       </style>
     </head>
@@ -2739,7 +2747,7 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
     </body>
     </html>
     """
-    components.html(html, height=500, scrolling=False)
+    components.html(html, height=390, scrolling=False)
 
 
 def build_single_job_ui() -> None:
