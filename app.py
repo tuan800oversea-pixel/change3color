@@ -2620,8 +2620,6 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
           border: 1px solid #e3d7c6;
           border-radius: 16px;
           padding: 10px;
-          width: fit-content;
-          max-width: 100%;
         }}
         .refs-title {{
           font-size: 13px;
@@ -2629,10 +2627,9 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
           margin-bottom: 8px;
         }}
         .refs-grid {{
-          display: flex;
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
           gap: 8px;
-          flex-wrap: wrap;
-          align-items: flex-start;
         }}
         .gallery-title {{
           font-size: 13px;
@@ -2643,18 +2640,17 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
           display: flex;
           gap: 10px;
           overflow-x: auto;
-          padding: 2px 0 6px;
+          padding: 2px 0 2px;
           cursor: grab;
           scroll-behavior: smooth;
           scrollbar-width: thin;
-          align-items: flex-start;
         }}
         .gallery.dragging {{
           cursor: grabbing;
           user-select: none;
         }}
         .candidate-card {{
-          flex: 0 0 176px;
+          flex: 0 0 180px;
           background: #fffdf9;
           border: 1px solid #e3d7c6;
           border-radius: 14px;
@@ -2676,8 +2672,6 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
           border: 1px solid #eadfce;
           border-radius: 12px;
           padding: 8px;
-          width: 176px;
-          box-sizing: border-box;
         }}
         .ref-title {{
           font-size: 12px;
@@ -2685,7 +2679,7 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
           margin-bottom: 6px;
         }}
         .result-wrap {{
-          padding: 0 8px 10px;
+          padding: 0 8px 8px;
         }}
         img {{
           width: 100%;
@@ -2696,13 +2690,10 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
           background: #ffffff;
         }}
         .refs-panel img {{
-          height: 138px;
-          object-fit: contain;
+          max-height: 120px;
         }}
         .candidate-card img {{
-          width: 100%;
-          max-height: 220px;
-          object-fit: contain;
+          max-height: 190px;
         }}
       </style>
     </head>
@@ -2745,7 +2736,7 @@ def render_candidate_gallery(result: dict[str, Any]) -> None:
     </body>
     </html>
     """
-    components.html(html, height=800, scrolling=False)
+    components.html(html, height=360, scrolling=False)
 
 
 def build_single_job_ui() -> None:
@@ -3291,9 +3282,304 @@ def build_job_inputs(
     }
 
 
+STREAMLIT_SAFE_MAX_SIDE = 1600
+STREAMLIT_SAFE_TOP_N = 3
+
+
+def constrain_image_for_streamlit(img: np.ndarray | None, max_side: int = STREAMLIT_SAFE_MAX_SIDE) -> np.ndarray | None:
+    if img is None:
+        return None
+    bgr = ensure_bgr(img)
+    h, w = bgr.shape[:2]
+    longest = max(h, w)
+    if longest <= max_side:
+        return bgr
+    scale = max_side / float(longest)
+    return cv2.resize(bgr, (max(1, int(round(w * scale))), max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
+
+
+def load_uploaded_image(uploaded_file: Any) -> np.ndarray | None:
+    if uploaded_file is None:
+        return None
+    img = read_image_bytes(uploaded_file.getvalue())
+    return constrain_image_for_streamlit(img)
+
+
+def slim_regions_for_result(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    slimmed: list[dict[str, Any]] = []
+    for region in regions:
+        slim_candidates = []
+        for cand in region["candidates"][:3]:
+            slim_candidates.append(
+                {
+                    "params": cand["params"],
+                    "de": float(cand["de"]),
+                    "lab": np.asarray(cand["lab"], dtype=np.float32),
+                    "label": cand["label"],
+                    "is_neon": cand["is_neon"],
+                }
+            )
+        slimmed.append(
+            {
+                "name": region["name"],
+                "mask_3d": region["mask_3d"],
+                "mask_source": region.get("mask_source"),
+                "target": region["target"],
+                "candidates": slim_candidates,
+            }
+        )
+    return slimmed
+
+
+def slim_combos_for_result(combos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "image": combo["image"],
+            "de": float(combo["de"]),
+            "score": float(combo.get("score", combo["de"])),
+            "region_de": {name: float(value) for name, value in combo["region_de"].items()},
+            "harmony_penalty": float(combo.get("harmony_penalty", 0.0)),
+            "harmony_pairs": {name: float(value) for name, value in combo.get("harmony_pairs", {}).items()},
+        }
+        for combo in combos[:STREAMLIT_SAFE_TOP_N]
+    ]
+
+
+def build_job_inputs(
+    job_label: str,
+    orig_img: np.ndarray,
+    region_sources: list[dict[str, Any]],
+    ref_inputs: list[dict[str, Any]],
+    region_to_target: list[int],
+    top_n: int = STREAMLIT_SAFE_TOP_N,
+) -> dict[str, Any]:
+    orig_bgr = constrain_image_for_streamlit(orig_img)
+    safe_ref_inputs: list[dict[str, Any]] = []
+    for item in ref_inputs:
+        safe_ref_inputs.append(
+            {
+                "label": item["label"],
+                "validation_image": constrain_image_for_streamlit(item["validation_image"]),
+                "render_image": constrain_image_for_streamlit(item.get("render_image")),
+            }
+        )
+    targets = [analyze_target_input(item) for item in safe_ref_inputs]
+    regions: list[dict[str, Any]] = []
+    for index, region in enumerate(region_sources):
+        mask_source = constrain_image_for_streamlit(region["mask_source"], max_side=STREAMLIT_SAFE_MAX_SIDE)
+        mask_3d = preprocess_mask(mask_source, orig_bgr.shape[:2])
+        target = targets[region_to_target[index]]
+        candidates = optimize_region_candidates(orig_bgr, mask_3d, target, region["name"], top_n=max(top_n, 3))
+        candidates = expand_region_candidates(orig_bgr, mask_3d, target, region["name"], candidates, max(top_n, 3))
+        regions.append(
+            {
+                "name": region["name"],
+                "mask_3d": mask_3d,
+                "mask_source": mask_source,
+                "target": target,
+                "candidates": candidates,
+            }
+        )
+    combos = build_result_combinations(orig_bgr, regions, top_n=top_n)
+    combos = slim_combos_for_result(combos)
+    result_regions = slim_regions_for_result(regions)
+    payload = build_result_payload(job_label, targets, result_regions, combos)
+    return {
+        "job_label": job_label,
+        "orig_bgr": orig_bgr,
+        "targets": targets,
+        "regions": result_regions,
+        "combos": combos,
+        "payload": payload,
+    }
+
+
+def render_result_downloads(result: dict[str, Any]) -> None:
+    if not result["combos"]:
+        st.warning("没有生成可用候选图，请检查蒙版或参考图。")
+        return
+    best = result["combos"][0]
+    jpg_bytes = image_to_bytes(best["image"], ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 96])
+    with st.container():
+        cols = st.columns([1.2, 1.2, 2.2])
+        with cols[0]:
+            st.download_button(
+                "下载最佳 JPG",
+                jpg_bytes,
+                file_name=f"{slugify(result['job_label'])}_best.jpg",
+                mime="image/jpeg",
+                use_container_width=True,
+            )
+        with cols[1]:
+            st.download_button(
+                "下载颜色 JSON",
+                json.dumps(result["payload"], ensure_ascii=False, indent=2).encode("utf-8"),
+                file_name=f"{slugify(result['job_label'])}_report.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        with cols[2]:
+            st.caption("高级导出更吃内存。云端环境建议只在确定需要时再准备。")
+    with st.expander("准备高级导出（PSD / ZIP / HTML）"):
+        if st.button("生成高级导出文件", key="prepare_advanced_exports", use_container_width=True):
+            with st.spinner("正在准备高级导出文件，这一步会更慢，也更吃内存..."):
+                html = build_result_html(result["job_label"], result["orig_bgr"], result["targets"], result["combos"])
+                psd_bytes = create_layered_psd_bytes(result["job_label"], result["orig_bgr"], result["combos"][0], result["targets"], result["regions"])
+                advanced_result = {**result, "html": html, "psd_bytes": psd_bytes}
+                zip_bytes = build_export_zip(advanced_result)
+            adv_cols = st.columns(3)
+            with adv_cols[0]:
+                st.download_button(
+                    "下载分层 PSD",
+                    psd_bytes,
+                    file_name=f"{slugify(result['job_label'])}_best.psd",
+                    mime="image/vnd.adobe.photoshop",
+                    use_container_width=True,
+                )
+            with adv_cols[1]:
+                st.download_button(
+                    "下载导出包 ZIP",
+                    zip_bytes,
+                    file_name=f"{slugify(result['job_label'])}_export.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+            with adv_cols[2]:
+                st.download_button(
+                    "下载报告 HTML",
+                    html.encode("utf-8"),
+                    file_name=f"{slugify(result['job_label'])}_report.html",
+                    mime="text/html",
+                    use_container_width=True,
+                )
+
+
+def render_candidate_gallery(result: dict[str, Any]) -> None:
+    combos = result["combos"][:STREAMLIT_SAFE_TOP_N]
+    if not combos:
+        return
+    st.markdown("**参考模特图**")
+    ref_cols = st.columns(len(result["targets"]))
+    for idx, target in enumerate(result["targets"]):
+        with ref_cols[idx]:
+            st.image(cv2.cvtColor(target["image_bgr"], cv2.COLOR_BGR2RGB), caption=target["label"], use_container_width=True)
+    st.markdown("**最佳候选**")
+    cols = st.columns(len(combos))
+    for idx, combo in enumerate(combos):
+        with cols[idx]:
+            st.image(cv2.cvtColor(combo["image"], cv2.COLOR_BGR2RGB), caption=f"候选 {idx + 1}", use_container_width=True)
+            st.caption(f"DeltaE {combo['de']:.2f}")
+
+
+def build_single_job_ui() -> None:
+    sample_names = available_sample_names()
+    has_local_samples = bool(sample_names)
+    source_options = ["本地样例", "手动上传"] if has_local_samples else ["手动上传"]
+    source_mode = st.radio("输入方式", source_options, horizontal=True)
+
+    sample_name = "manual"
+    if source_mode == "本地样例" and has_local_samples:
+        sample_name = st.selectbox("选择样例", sample_names)
+        try:
+            sample = discover_sample_bundle(sample_name)
+        except FileNotFoundError:
+            st.warning("本地样例资源不存在，已切换为手动上传模式。")
+            source_mode = "手动上传"
+            sample = None
+        if sample is not None:
+            region_count = sample["region_count"]
+            orig_img = constrain_image_for_streamlit(sample["orig_img"])
+            region_sources = [{"name": item["name"], "mask_source": constrain_image_for_streamlit(item["mask_source"])} for item in sample["region_sources"]]
+        else:
+            region_count = st.radio("套装区域数", [1, 2], horizontal=True, format_func=lambda value: "一件套" if value == 1 else "两件套")
+            orig_file = st.file_uploader("上传原图", type=["jpg", "jpeg", "png"])
+            orig_img = load_uploaded_image(orig_file)
+            region_sources = []
+            if region_count == 1:
+                mask_file = st.file_uploader("上传主体蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="stable_mask_one_fallback")
+                region_sources.append({"name": "主体", "mask_source": load_uploaded_image(mask_file)})
+            else:
+                top_file = st.file_uploader("上传上衣蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="stable_mask_top_fallback")
+                bottom_file = st.file_uploader("上传底裤蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="stable_mask_bottom_fallback")
+                region_sources.extend(
+                    [
+                        {"name": "上衣", "mask_source": load_uploaded_image(top_file)},
+                        {"name": "底裤", "mask_source": load_uploaded_image(bottom_file)},
+                    ]
+                )
+    else:
+        region_count = st.radio("套装区域数", [1, 2], horizontal=True, format_func=lambda value: "一件套" if value == 1 else "两件套")
+        orig_file = st.file_uploader("上传原图", type=["jpg", "jpeg", "png"])
+        orig_img = load_uploaded_image(orig_file)
+        region_sources = []
+        if region_count == 1:
+            mask_file = st.file_uploader("上传主体蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="stable_mask_one")
+            region_sources.append({"name": "主体", "mask_source": load_uploaded_image(mask_file)})
+        else:
+            top_file = st.file_uploader("上传上衣蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="stable_mask_top")
+            bottom_file = st.file_uploader("上传底裤蒙版 / 白底对齐图", type=["jpg", "jpeg", "png"], key="stable_mask_bottom")
+            region_sources.extend(
+                [
+                    {"name": "上衣", "mask_source": load_uploaded_image(top_file)},
+                    {"name": "底裤", "mask_source": load_uploaded_image(bottom_file)},
+                ]
+            )
+
+    color_count = 1 if region_count == 1 else st.radio("调色数量", [1, 2], horizontal=True, format_func=lambda value: "同一颜色" if value == 1 else "两个颜色")
+    ref_paths = list_reference_paths() if source_mode == "本地样例" else []
+    ref_inputs: list[dict[str, Any]] = []
+    ref_name_map = {path.name: path for path in ref_paths}
+    ref_name_options = list(ref_name_map.keys())
+    if source_mode == "本地样例" and not ref_paths:
+        source_mode = "手动上传"
+    for idx in range(color_count):
+        label_default = f"颜色 {idx + 1}"
+        with st.container(border=True):
+            st.markdown(f"**{label_default}**")
+            if source_mode == "本地样例" and ref_name_options:
+                default_index = min(idx, len(ref_name_options) - 1)
+                validation_name = st.selectbox(f"{label_default} 选择带模特校验图", ref_name_options, index=default_index, key=f"stable_validation_ref_{idx}")
+                validation_path = ref_name_map[validation_name]
+                validation_image = constrain_image_for_streamlit(read_image_path(validation_path))
+                label = validation_path.stem
+            else:
+                validation_file = st.file_uploader(f"{label_default} 上传带模特校验图（必传）", type=["jpg", "jpeg", "png"], key=f"stable_validation_upload_{idx}")
+                validation_image = load_uploaded_image(validation_file)
+                label = Path(validation_file.name).stem if validation_file is not None else label_default
+            render_file = st.file_uploader(f"{label_default} 上传纯色色块图（可选）", type=["jpg", "jpeg", "png"], key=f"stable_render_upload_{idx}")
+            render_image = load_uploaded_image(render_file)
+            ref_inputs.append({"label": label, "validation_image": validation_image, "render_image": render_image})
+
+    region_map = [0] if region_count == 1 else ([0, 0] if color_count == 1 else [0, 1])
+    if st.button("开始调色（云端稳态版）", use_container_width=True):
+        if orig_img is None:
+            st.error("请先提供原图。")
+            return
+        if any(item["mask_source"] is None for item in region_sources):
+            st.error("请先提供所有区域的蒙版或对齐白底图。")
+            return
+        if any(item["validation_image"] is None for item in ref_inputs):
+            st.error("请先提供每个颜色的带模特校验图。")
+            return
+        st.info("当前版本优先保证云端稳定：默认更少候选，且高级导出改为按需生成。")
+        with st.spinner("正在生成更稳的候选结果..."):
+            result = build_job_inputs(
+                "手动调色任务" if source_mode == "手动上传" else f"{sample_name}_调色任务",
+                orig_img,
+                region_sources,
+                ref_inputs,
+                region_map,
+                top_n=STREAMLIT_SAFE_TOP_N,
+            )
+        st.success(f"已完成，共生成 {len(result['combos'])} 组候选结果。")
+        render_result_downloads(result)
+        render_candidate_gallery(result)
+
+
 def main() -> None:
-    st.set_page_config(page_title="智能泳衣调色工具", layout="wide")
-    st.title("智能泳衣调色工具")
+    st.set_page_config(page_title="智能泳衣调色工具 - 云端稳态版", layout="wide")
+    st.title("智能泳衣调色工具 - 云端稳态版")
+    st.caption("这个版本优先减少 Streamlit Cloud 的内存压力：默认更少候选、预览优先、高级导出按需生成。")
     build_single_job_ui()
 
 
