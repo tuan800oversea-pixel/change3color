@@ -500,8 +500,24 @@ def render_standard(orig_img: np.ndarray, gray_img: np.ndarray, mask_3d: np.ndar
     flat_mask = np.clip(mask_3d[:, :, 0] * (1.0 - np.clip(structure_mask, 0.0, 1.0)), 0.0, 1.0)
     current_mean_l = float(np.mean(img_gamma[mask_bool])) if np.any(mask_bool) else 0.5
     target_l = np.clip(l_t + l_off, 0, 255)
+    current_mean_l_255 = current_mean_l * 255.0
+    black_to_light_strength = float(
+        np.clip((82.0 - current_mean_l_255) / 58.0, 0.0, 1.0)
+        * np.clip((target_l - 156.0) / 72.0, 0.0, 1.0)
+    )
     shift_l = (target_l / 255.0) - current_mean_l
     shadow_map = np.clip((img_gamma + shift_l) * 255.0 + detail_layer, 0, 255.0)
+    if black_to_light_strength > 0.02:
+        lifted_map = np.clip(
+            target_l * (0.72 + 0.20 * black_to_light_strength)
+            + (img_gamma * 255.0 - current_mean_l_255) * (0.32 - 0.10 * black_to_light_strength)
+            + detail_layer * (0.26 + 0.10 * black_to_light_strength),
+            0.0,
+            255.0,
+        )
+        lift_alpha = np.clip(mask_3d[:, :, 0] * (0.42 + 0.34 * black_to_light_strength), 0.0, 1.0)
+        lift_alpha *= (1.0 - 0.46 * structure_mask)
+        shadow_map = shadow_map * (1.0 - lift_alpha) + lifted_map * lift_alpha
     if white_strength > 0.03:
         highlight_map = np.clip((shadow_map - 118.0) / 110.0, 0.0, 1.0) * (1.0 - 0.55 * structure_mask)
         shadow_map = np.clip(shadow_map + highlight_map * (7.0 + 12.0 * white_strength), 0.0, 255.0)
@@ -568,6 +584,14 @@ def render_standard(orig_img: np.ndarray, gray_img: np.ndarray, mask_3d: np.ndar
         result_lab[:, :, 1] = result_lab[:, :, 1] * (1.0 - ab_alpha) + final_a * ab_alpha
         result_lab[:, :, 2] = result_lab[:, :, 2] * (1.0 - ab_alpha) + final_b * ab_alpha
         result_bgr = cv2.cvtColor(result_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    if black_to_light_strength > 0.02:
+        result_lab = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        mask_alpha = np.clip(mask_3d[:, :, 0], 0.0, 1.0)
+        lift_focus = np.clip(mask_alpha * (0.24 + 0.30 * black_to_light_strength) * (1.0 - 0.58 * structure_mask), 0.0, 1.0)
+        result_lab[:, :, 0] = result_lab[:, :, 0] * (1.0 - lift_focus) + np.clip(target_l + 6.0, 0.0, 255.0) * lift_focus
+        result_lab[:, :, 1] = result_lab[:, :, 1] * (1.0 - 0.18 * lift_focus) + final_a * (0.18 * lift_focus)
+        result_lab[:, :, 2] = result_lab[:, :, 2] * (1.0 - 0.18 * lift_focus) + final_b * (0.18 * lift_focus)
+        result_bgr = cv2.cvtColor(np.clip(result_lab, 0.0, 255.0).astype(np.uint8), cv2.COLOR_LAB2BGR)
     final_f = (result_bgr.astype(np.float32) / 255.0) * mask_3d + (orig_img.astype(np.float32) / 255.0) * (1.0 - mask_3d)
     return (np.clip(final_f, 0, 1) * 255.0).astype(np.uint8)
 
@@ -2526,6 +2550,17 @@ def discover_sample_bundle(sample_name: str) -> dict[str, Any]:
             "orig_img": read_image_path(orig_path),
             "region_sources": [{"name": "主体", "mask_source": read_image_path(mask_path)}],
         }
+    if sample_name == "E":
+        orig_path = folder / "11.jpg"
+        mask_path = folder / "11.png"
+        if not orig_path.exists() or not mask_path.exists():
+            raise FileNotFoundError(f"Sample folder not found: {folder}")
+        return {
+            "label": sample_name,
+            "region_count": 1,
+            "orig_img": read_image_path(orig_path),
+            "region_sources": [{"name": "主体", "mask_source": read_image_path(mask_path)}],
+        }
     folder = APP_DIR / sample_name
     if not folder.exists() or not folder.is_dir():
         raise FileNotFoundError(f"Sample folder not found: {folder}")
@@ -2558,7 +2593,7 @@ def discover_sample_bundle(sample_name: str) -> dict[str, Any]:
 
 def available_sample_names() -> list[str]:
     names: list[str] = []
-    for sample_name in ["A", "B", "C", "D"]:
+    for sample_name in ["A", "B", "C", "D", "E"]:
         folder = APP_DIR / sample_name
         if not folder.exists() or not folder.is_dir():
             continue
