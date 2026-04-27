@@ -34,27 +34,6 @@ class ColorSpec:
     css: str
 
 
-def inject_css() -> None:
-    st.markdown(
-        """
-        <style>
-        .block-container {
-            padding-top: 1.2rem;
-            padding-bottom: 2rem;
-            max-width: 1380px;
-        }
-        .stButton > button, .stDownloadButton > button {
-            border-radius: 14px;
-        }
-        img {
-            border-radius: 14px;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
 def slugify(value: str) -> str:
     cleaned = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", value, flags=re.UNICODE)
     return cleaned.strip("_") or "result"
@@ -521,24 +500,8 @@ def render_standard(orig_img: np.ndarray, gray_img: np.ndarray, mask_3d: np.ndar
     flat_mask = np.clip(mask_3d[:, :, 0] * (1.0 - np.clip(structure_mask, 0.0, 1.0)), 0.0, 1.0)
     current_mean_l = float(np.mean(img_gamma[mask_bool])) if np.any(mask_bool) else 0.5
     target_l = np.clip(l_t + l_off, 0, 255)
-    current_mean_l_255 = current_mean_l * 255.0
-    black_to_light_strength = float(
-        np.clip((82.0 - current_mean_l_255) / 58.0, 0.0, 1.0)
-        * np.clip((target_l - 156.0) / 72.0, 0.0, 1.0)
-    )
     shift_l = (target_l / 255.0) - current_mean_l
     shadow_map = np.clip((img_gamma + shift_l) * 255.0 + detail_layer, 0, 255.0)
-    if black_to_light_strength > 0.02:
-        lifted_map = np.clip(
-            target_l * (0.72 + 0.20 * black_to_light_strength)
-            + (img_gamma * 255.0 - current_mean_l_255) * (0.32 - 0.10 * black_to_light_strength)
-            + detail_layer * (0.26 + 0.10 * black_to_light_strength),
-            0.0,
-            255.0,
-        )
-        lift_alpha = np.clip(mask_3d[:, :, 0] * (0.42 + 0.34 * black_to_light_strength), 0.0, 1.0)
-        lift_alpha *= (1.0 - 0.46 * structure_mask)
-        shadow_map = shadow_map * (1.0 - lift_alpha) + lifted_map * lift_alpha
     if white_strength > 0.03:
         highlight_map = np.clip((shadow_map - 118.0) / 110.0, 0.0, 1.0) * (1.0 - 0.55 * structure_mask)
         shadow_map = np.clip(shadow_map + highlight_map * (7.0 + 12.0 * white_strength), 0.0, 255.0)
@@ -605,14 +568,6 @@ def render_standard(orig_img: np.ndarray, gray_img: np.ndarray, mask_3d: np.ndar
         result_lab[:, :, 1] = result_lab[:, :, 1] * (1.0 - ab_alpha) + final_a * ab_alpha
         result_lab[:, :, 2] = result_lab[:, :, 2] * (1.0 - ab_alpha) + final_b * ab_alpha
         result_bgr = cv2.cvtColor(result_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
-    if black_to_light_strength > 0.02:
-        result_lab = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-        mask_alpha = np.clip(mask_3d[:, :, 0], 0.0, 1.0)
-        lift_focus = np.clip(mask_alpha * (0.24 + 0.30 * black_to_light_strength) * (1.0 - 0.58 * structure_mask), 0.0, 1.0)
-        result_lab[:, :, 0] = result_lab[:, :, 0] * (1.0 - lift_focus) + np.clip(target_l + 6.0, 0.0, 255.0) * lift_focus
-        result_lab[:, :, 1] = result_lab[:, :, 1] * (1.0 - 0.18 * lift_focus) + final_a * (0.18 * lift_focus)
-        result_lab[:, :, 2] = result_lab[:, :, 2] * (1.0 - 0.18 * lift_focus) + final_b * (0.18 * lift_focus)
-        result_bgr = cv2.cvtColor(np.clip(result_lab, 0.0, 255.0).astype(np.uint8), cv2.COLOR_LAB2BGR)
     final_f = (result_bgr.astype(np.float32) / 255.0) * mask_3d + (orig_img.astype(np.float32) / 255.0) * (1.0 - mask_3d)
     return (np.clip(final_f, 0, 1) * 255.0).astype(np.uint8)
 
@@ -1323,6 +1278,17 @@ def discover_sample_bundle(sample_name: str) -> dict[str, Any]:
                 {"name": "底裤", "mask_source": read_image_path(bottom_path)},
             ],
         }
+    if sample_name == "E":
+        orig_path = folder / "11.jpg"
+        mask_path = folder / "11.png"
+        if not orig_path.exists() or not mask_path.exists():
+            raise FileNotFoundError(f"Sample E is missing required files: {folder}")
+        return {
+            "label": sample_name,
+            "region_count": 1,
+            "orig_img": read_image_path(orig_path),
+            "region_sources": [{"name": "??", "mask_source": read_image_path(mask_path)}],
+        }
     alpha_files = [path for path in files if read_image_path(path) is not None and extract_alpha(read_image_path(path)) is not None]
     mask_path = alpha_files[0] if alpha_files else files[-1]
     orig_path = next(path for path in files if path != mask_path)
@@ -1336,7 +1302,7 @@ def discover_sample_bundle(sample_name: str) -> dict[str, Any]:
 
 def available_sample_names() -> list[str]:
     names: list[str] = []
-    for sample_name in ["A", "B", "C"]:
+    for sample_name in ["A", "B", "C", "D", "E"]:
         folder = APP_DIR / sample_name
         if not folder.exists() or not folder.is_dir():
             continue
@@ -1635,74 +1601,69 @@ def render_result_downloads(result: dict[str, Any]) -> None:
         return
 
     best = result["combos"][0]
-    jpg_bytes = image_to_bytes(best["image"], ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+    jpg_bytes = image_to_bytes(best["image"], ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 96])
     json_bytes = json.dumps(result["payload"], ensure_ascii=False, indent=2).encode("utf-8")
     export_state_key = f"stable_advanced_exports::{result['job_label']}"
     export_state = st.session_state.get(export_state_key)
 
-    download_cols = st.columns(5)
-    with download_cols[0]:
-        st.download_button(
-            "???? JPG",
-            jpg_bytes,
-            file_name=f"{slugify(result['job_label'])}_best.jpg",
-            mime="image/jpeg",
-            use_container_width=True,
-        )
-    with download_cols[1]:
-        if export_state:
+    with st.container():
+        cols = st.columns(5)
+        with cols[0]:
             st.download_button(
-                "???? PSD",
-                export_state["psd_bytes"],
-                file_name=f"{slugify(result['job_label'])}_best.psd",
-                mime="image/vnd.adobe.photoshop",
+                "???? JPG",
+                jpg_bytes,
+                file_name=f"{slugify(result['job_label'])}_best.jpg",
+                mime="image/jpeg",
                 use_container_width=True,
             )
-        else:
-            st.button("???? PSD", disabled=True, use_container_width=True, key=f"disabled_psd_{slugify(result['job_label'])}")
-    with download_cols[2]:
-        if export_state:
+        with cols[1]:
+            if export_state:
+                st.download_button(
+                    "???? PSD",
+                    export_state["psd_bytes"],
+                    file_name=f"{slugify(result['job_label'])}_best.psd",
+                    mime="image/vnd.adobe.photoshop",
+                    use_container_width=True,
+                )
+            else:
+                st.button("???? PSD", disabled=True, use_container_width=True, key=f"disabled_psd_{slugify(result['job_label'])}")
+        with cols[2]:
+            if export_state:
+                st.download_button(
+                    "????? ZIP",
+                    export_state["zip_bytes"],
+                    file_name=f"{slugify(result['job_label'])}_export.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+            else:
+                st.button("????? ZIP", disabled=True, use_container_width=True, key=f"disabled_zip_{slugify(result['job_label'])}")
+        with cols[3]:
+            if export_state:
+                st.download_button(
+                    "???? HTML",
+                    export_state["html_bytes"],
+                    file_name=f"{slugify(result['job_label'])}_report.html",
+                    mime="text/html",
+                    use_container_width=True,
+                )
+            else:
+                st.button("???? HTML", disabled=True, use_container_width=True, key=f"disabled_html_{slugify(result['job_label'])}")
+        with cols[4]:
             st.download_button(
-                "????? ZIP",
-                export_state["zip_bytes"],
-                file_name=f"{slugify(result['job_label'])}_export.zip",
-                mime="application/zip",
+                "???? JSON",
+                json_bytes,
+                file_name=f"{slugify(result['job_label'])}_report.json",
+                mime="application/json",
                 use_container_width=True,
             )
-        else:
-            st.button("????? ZIP", disabled=True, use_container_width=True, key=f"disabled_zip_{slugify(result['job_label'])}")
-    with download_cols[3]:
-        if export_state:
-            st.download_button(
-                "???? HTML",
-                export_state["html_bytes"],
-                file_name=f"{slugify(result['job_label'])}_report.html",
-                mime="text/html",
-                use_container_width=True,
-            )
-        else:
-            st.button("???? HTML", disabled=True, use_container_width=True, key=f"disabled_html_{slugify(result['job_label'])}")
-    with download_cols[4]:
-        st.download_button(
-            "???? JSON",
-            json_bytes,
-            file_name=f"{slugify(result['job_label'])}_report.json",
-            mime="application/json",
-            use_container_width=True,
-        )
 
     with st.expander("???????PSD / ZIP / HTML?", expanded=export_state is None):
         if export_state is None:
             if st.button("??????", key=f"prepare_advanced_exports_{slugify(result['job_label'])}", use_container_width=True):
                 with st.spinner("???????????????????????..."):
                     html = build_result_html(result["job_label"], result["orig_bgr"], result["targets"], result["combos"])
-                    psd_bytes = create_layered_psd_bytes(
-                        result["job_label"],
-                        result["orig_bgr"],
-                        result["combos"][0],
-                        result["targets"],
-                        result["regions"],
-                    )
+                    psd_bytes = create_layered_psd_bytes(result["job_label"], result["orig_bgr"], result["combos"][0], result["targets"], result["regions"])
                     advanced_result = {**result, "html": html, "psd_bytes": psd_bytes}
                     zip_bytes = build_export_zip(advanced_result)
                 st.session_state[export_state_key] = {
@@ -1715,17 +1676,177 @@ def render_result_downloads(result: dict[str, Any]) -> None:
             st.success("???????????????????")
 
 
-def load_uploaded_image(uploaded_file: Any) -> np.ndarray | None:
-    if uploaded_file is None:
-        return None
-    return read_image_bytes(uploaded_file.getvalue())
+def render_candidate_gallery(result: dict[str, Any]) -> None:
+    combos = result["combos"][:5]
+    if not combos:
+        return
+    references_html = "".join(
+        f"""
+        <div class="ref-item">
+          <div class="ref-title">{target['label']} 参考模特图</div>
+          <img src="data:image/jpeg;base64,{image_to_base64_jpg(target['image_bgr'])}" />
+        </div>
+        """
+        for target in result["targets"]
+    )
+    cards_html: list[str] = []
+    for idx, combo in enumerate(combos, start=1):
+        cards_html.append(
+            f"""
+            <article class="candidate-card">
+              <div class="candidate-head">候选 {idx}</div>
+              <div class="candidate-meta">DeltaE {combo['de']:.2f}</div>
+              <div class="result-wrap">
+                <img src="data:image/jpeg;base64,{image_to_base64_jpg(combo['image'])}" />
+              </div>
+            </article>
+            """
+        )
+    html = f"""
+    <!doctype html>
+    <html lang="zh-CN">
+    <head>
+      <meta charset="utf-8" />
+      <style>
+        body {{
+          margin: 0;
+          font-family: "Segoe UI", "PingFang SC", sans-serif;
+          background: #f7f3ec;
+          color: #334155;
+        }}
+        .shell {{
+          display: grid;
+          gap: 10px;
+          padding: 0;
+        }}
+        .refs-panel {{
+          background: #fffdf9;
+          border: 1px solid #e3d7c6;
+          border-radius: 16px;
+          padding: 10px;
+        }}
+        .refs-title {{
+          font-size: 13px;
+          font-weight: 700;
+          margin-bottom: 8px;
+        }}
+        .refs-grid {{
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+          gap: 8px;
+        }}
+        .gallery-title {{
+          font-size: 13px;
+          font-weight: 700;
+          padding: 0 2px;
+        }}
+        .gallery {{
+          display: flex;
+          gap: 10px;
+          overflow-x: auto;
+          padding: 2px 0 2px;
+          cursor: grab;
+          scroll-behavior: smooth;
+          scrollbar-width: thin;
+        }}
+        .gallery.dragging {{
+          cursor: grabbing;
+          user-select: none;
+        }}
+        .candidate-card {{
+          flex: 0 0 180px;
+          background: #fffdf9;
+          border: 1px solid #e3d7c6;
+          border-radius: 14px;
+          overflow: hidden;
+          box-shadow: 0 8px 18px rgba(77, 54, 26, 0.08);
+        }}
+        .candidate-head {{
+          padding: 10px 10px 2px;
+          font-size: 13px;
+          font-weight: 700;
+        }}
+        .candidate-meta {{
+          padding: 0 10px 6px;
+          font-size: 12px;
+          color: #64748b;
+        }}
+        .ref-item {{
+          background: #faf7f2;
+          border: 1px solid #eadfce;
+          border-radius: 12px;
+          padding: 8px;
+        }}
+        .ref-title {{
+          font-size: 12px;
+          color: #64748b;
+          margin-bottom: 6px;
+        }}
+        .result-wrap {{
+          padding: 0 8px 8px;
+        }}
+        img {{
+          width: 100%;
+          display: block;
+          border-radius: 10px;
+          border: 1px solid #eadfce;
+          object-fit: contain;
+          background: #ffffff;
+        }}
+        .refs-panel img {{
+          max-height: 120px;
+        }}
+        .candidate-card img {{
+          max-height: 190px;
+        }}
+      </style>
+    </head>
+    <body>
+      <div class="shell">
+        <section class="refs-panel">
+          <div class="refs-title">参考模特图</div>
+          <div class="refs-grid">{references_html}</div>
+        </section>
+        <div class="gallery-title">向左右滑动查看 5 张最佳候选</div>
+        <div id="gallery" class="gallery">{''.join(cards_html)}</div>
+      </div>
+      <script>
+        const gallery = document.getElementById("gallery");
+        let isDown = false;
+        let startX = 0;
+        let scrollLeft = 0;
+        gallery.addEventListener("mousedown", (event) => {{
+          isDown = true;
+          gallery.classList.add("dragging");
+          startX = event.pageX - gallery.offsetLeft;
+          scrollLeft = gallery.scrollLeft;
+        }});
+        gallery.addEventListener("mouseleave", () => {{
+          isDown = false;
+          gallery.classList.remove("dragging");
+        }});
+        gallery.addEventListener("mouseup", () => {{
+          isDown = false;
+          gallery.classList.remove("dragging");
+        }});
+        gallery.addEventListener("mousemove", (event) => {{
+          if (!isDown) return;
+          event.preventDefault();
+          const x = event.pageX - gallery.offsetLeft;
+          const walk = (x - startX) * 1.1;
+          gallery.scrollLeft = scrollLeft - walk;
+        }});
+      </script>
+    </body>
+    </html>
+    """
+    components.html(html, height=360, scrolling=False)
 
 
 def build_single_job_ui() -> None:
     result_state_key = "stable_last_result"
     sample_names = available_sample_names()
     has_local_samples = bool(sample_names)
-
     top_cols = st.columns([1.1, 1.1, 1.0, 1.0])
     source_options = ["????", "????"] if has_local_samples else ["????"]
     with top_cols[0]:
@@ -1735,7 +1856,6 @@ def build_single_job_ui() -> None:
     region_count = 1
     orig_img = None
     region_sources: list[dict[str, Any]] = []
-
     if source_mode == "????" and has_local_samples:
         with top_cols[1]:
             sample_name = st.selectbox("????", sample_names, label_visibility="collapsed")
@@ -1748,112 +1868,89 @@ def build_single_job_ui() -> None:
         if sample is not None:
             region_count = sample["region_count"]
             orig_img = constrain_image_for_streamlit(sample["orig_img"])
-            region_sources = [
-                {
-                    "name": item["name"],
-                    "mask_source": constrain_image_for_streamlit(item["mask_source"]),
-                }
-                for item in sample["region_sources"]
-            ]
-
-    if source_mode == "????" or not region_sources:
+            region_sources = [{"name": item["name"], "mask_source": constrain_image_for_streamlit(item["mask_source"])} for item in sample["region_sources"]]
+        else:
+            with top_cols[2]:
+                region_count = st.radio("????", [1, 2], horizontal=True, format_func=lambda value: "???" if value == 1 else "???", label_visibility="collapsed")
+            orig_cols = st.columns(3 if region_count == 1 else 4)
+            with orig_cols[0]:
+                orig_file = st.file_uploader("??", type=["jpg", "jpeg", "png"])
+            orig_img = load_uploaded_image(orig_file)
+            if region_count == 1:
+                with orig_cols[1]:
+                    mask_file = st.file_uploader("????", type=["jpg", "jpeg", "png"], key="stable_mask_one_fallback")
+                region_sources.append({"name": "??", "mask_source": load_uploaded_image(mask_file)})
+            else:
+                with orig_cols[1]:
+                    top_file = st.file_uploader("????", type=["jpg", "jpeg", "png"], key="stable_mask_top_fallback")
+                with orig_cols[2]:
+                    bottom_file = st.file_uploader("????", type=["jpg", "jpeg", "png"], key="stable_mask_bottom_fallback")
+                region_sources.extend([
+                    {"name": "??", "mask_source": load_uploaded_image(top_file)},
+                    {"name": "??", "mask_source": load_uploaded_image(bottom_file)},
+                ])
+    else:
         with top_cols[1]:
-            region_count = st.radio(
-                "????",
-                [1, 2],
-                horizontal=True,
-                format_func=lambda value: "???" if value == 1 else "???",
-                label_visibility="collapsed",
-            )
+            region_count = st.radio("????", [1, 2], horizontal=True, format_func=lambda value: "???" if value == 1 else "???", label_visibility="collapsed")
         orig_cols = st.columns(3 if region_count == 1 else 4)
         with orig_cols[0]:
             orig_file = st.file_uploader("??", type=["jpg", "jpeg", "png"])
         orig_img = load_uploaded_image(orig_file)
-        region_sources = []
         if region_count == 1:
             with orig_cols[1]:
-                mask_file = st.file_uploader("????", type=["jpg", "jpeg", "png"], key="stable_mask_one_manual")
+                mask_file = st.file_uploader("????", type=["jpg", "jpeg", "png"], key="stable_mask_one")
             region_sources.append({"name": "??", "mask_source": load_uploaded_image(mask_file)})
         else:
             with orig_cols[1]:
-                top_file = st.file_uploader("????", type=["jpg", "jpeg", "png"], key="stable_mask_top_manual")
+                top_file = st.file_uploader("????", type=["jpg", "jpeg", "png"], key="stable_mask_top")
             with orig_cols[2]:
-                bottom_file = st.file_uploader("????", type=["jpg", "jpeg", "png"], key="stable_mask_bottom_manual")
-            region_sources.extend(
-                [
-                    {"name": "??", "mask_source": load_uploaded_image(top_file)},
-                    {"name": "??", "mask_source": load_uploaded_image(bottom_file)},
-                ]
-            )
+                bottom_file = st.file_uploader("????", type=["jpg", "jpeg", "png"], key="stable_mask_bottom")
+            region_sources.extend([
+                {"name": "??", "mask_source": load_uploaded_image(top_file)},
+                {"name": "??", "mask_source": load_uploaded_image(bottom_file)},
+            ])
 
     color_count = 1
     if region_count != 1:
         with top_cols[2]:
-            color_count = st.radio(
-                "????",
-                [1, 2],
-                horizontal=True,
-                format_func=lambda value: "????" if value == 1 else "????",
-                label_visibility="collapsed",
-            )
-
+            color_count = st.radio("????", [1, 2], horizontal=True, format_func=lambda value: "????" if value == 1 else "????", label_visibility="collapsed")
     ref_paths = list_reference_paths() if source_mode == "????" else []
+    ref_inputs: list[dict[str, Any]] = []
     ref_name_map = {path.name: path for path in ref_paths}
     ref_name_options = list(ref_name_map.keys())
-    ref_inputs: list[dict[str, Any]] = []
-
-    ref_cols = st.columns(max(color_count, 1))
+    if source_mode == "????" and not ref_paths:
+        source_mode = "????"
+    ref_cols = st.columns(color_count if color_count > 0 else 1)
     for idx in range(color_count):
         label_default = f"?? {idx + 1}"
         with ref_cols[idx]:
             st.markdown(f"**{label_default}**")
             if source_mode == "????" and ref_name_options:
                 default_index = min(idx, len(ref_name_options) - 1)
-                validation_name = st.selectbox(
-                    f"{label_default} ???",
-                    ref_name_options,
-                    index=default_index,
-                    key=f"stable_validation_ref_{idx}",
-                )
+                validation_name = st.selectbox(f"{label_default} ???", ref_name_options, index=default_index, key=f"stable_validation_ref_{idx}")
                 validation_path = ref_name_map[validation_name]
                 validation_image = constrain_image_for_streamlit(read_image_path(validation_path))
                 label = validation_path.stem
             else:
-                validation_file = st.file_uploader(
-                    f"{label_default} ???",
-                    type=["jpg", "jpeg", "png"],
-                    key=f"stable_validation_upload_{idx}",
-                )
+                validation_file = st.file_uploader(f"{label_default} ???", type=["jpg", "jpeg", "png"], key=f"stable_validation_upload_{idx}")
                 validation_image = load_uploaded_image(validation_file)
                 label = Path(validation_file.name).stem if validation_file is not None else label_default
-
-            render_file = st.file_uploader(
-                f"{label_default} ???",
-                type=["jpg", "jpeg", "png"],
-                key=f"stable_render_upload_{idx}",
-            )
+            render_file = st.file_uploader(f"{label_default} ???", type=["jpg", "jpeg", "png"], key=f"stable_render_upload_{idx}")
             render_image = load_uploaded_image(render_file)
-            ref_inputs.append(
-                {
-                    "label": label,
-                    "validation_image": validation_image,
-                    "render_image": render_image,
-                }
-            )
+            ref_inputs.append({"label": label, "validation_image": validation_image, "render_image": render_image})
 
     region_map = [0] if region_count == 1 else ([0, 0] if color_count == 1 else [0, 1])
-    generate_clicked = st.button("???????????", use_container_width=True)
-    if generate_clicked:
+    if st.button("???????????", use_container_width=True):
         if orig_img is None:
             st.error("???????")
             return
         if any(item["mask_source"] is None for item in region_sources):
-            st.error("??????????????????")
+            st.error("?????????????????")
             return
         if any(item["validation_image"] is None for item in ref_inputs):
             st.error("????????????????")
             return
-        st.info("?????????????????????????????")
+        st.info("????????????????????????????????")
         with st.spinner("???????????..."):
             result = build_job_inputs(
                 "??????" if source_mode == "????" else f"{sample_name}_????",
@@ -1864,7 +1961,6 @@ def build_single_job_ui() -> None:
                 top_n=STREAMLIT_SAFE_TOP_N,
             )
         st.session_state[result_state_key] = result
-
     result = st.session_state.get(result_state_key)
     if result and result.get("combos"):
         st.success(f"??????? {len(result['combos'])} ??????")
@@ -1880,289 +1976,5 @@ def main() -> None:
     build_single_job_ui()
 
 
-# --- Release overrides ---
-
-from pathlib import Path
-from typing import Any
-
-import cv2
-import streamlit as st
-
-
-
-RESULT_STATE_KEY = "release_last_result"
-
-
-def render_result_downloads(result: dict[str, Any]) -> None:
-    if not result["combos"]:
-        st.warning("没有生成可用候选图，请检查蒙版或参考图。")
-        return
-
-    best = result["combos"][0]
-    jpg_bytes = image_to_bytes(best["image"], ".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 96])
-    json_bytes = json.dumps(result["payload"], ensure_ascii=False, indent=2).encode("utf-8")
-    export_state_key = f"release_advanced_exports::{result['job_label']}"
-    export_state = st.session_state.get(export_state_key)
-
-    cols = st.columns(5)
-    with cols[0]:
-        st.download_button(
-            "下载最佳 JPG",
-            jpg_bytes,
-            file_name=f"{slugify(result['job_label'])}_best.jpg",
-            mime="image/jpeg",
-            use_container_width=True,
-        )
-    with cols[1]:
-        if export_state:
-            st.download_button(
-                "下载分层 PSD",
-                export_state["psd_bytes"],
-                file_name=f"{slugify(result['job_label'])}_best.psd",
-                mime="image/vnd.adobe.photoshop",
-                use_container_width=True,
-            )
-        else:
-            st.button("下载分层 PSD", disabled=True, use_container_width=True, key=f"disabled_psd_{slugify(result['job_label'])}")
-    with cols[2]:
-        if export_state:
-            st.download_button(
-                "下载导出包 ZIP",
-                export_state["zip_bytes"],
-                file_name=f"{slugify(result['job_label'])}_export.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
-        else:
-            st.button("下载导出包 ZIP", disabled=True, use_container_width=True, key=f"disabled_zip_{slugify(result['job_label'])}")
-    with cols[3]:
-        if export_state:
-            st.download_button(
-                "下载报告 HTML",
-                export_state["html_bytes"],
-                file_name=f"{slugify(result['job_label'])}_report.html",
-                mime="text/html",
-                use_container_width=True,
-            )
-        else:
-            st.button("下载报告 HTML", disabled=True, use_container_width=True, key=f"disabled_html_{slugify(result['job_label'])}")
-    with cols[4]:
-        st.download_button(
-            "下载颜色 JSON",
-            json_bytes,
-            file_name=f"{slugify(result['job_label'])}_report.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-
-    with st.expander("准备高级导出（PSD / ZIP / HTML）", expanded=export_state is None):
-        if export_state is None:
-            if st.button("生成导出文件", key=f"prepare_advanced_exports_{slugify(result['job_label'])}", use_container_width=True):
-                with st.spinner("正在准备高级导出文件，这一步会更慢，也更吃内存..."):
-                    html = build_result_html(result["job_label"], result["orig_bgr"], result["targets"], result["combos"])
-                    psd_bytes = create_layered_psd_bytes(
-                        result["job_label"],
-                        result["orig_bgr"],
-                        result["combos"][0],
-                        result["targets"],
-                        result["regions"],
-                    )
-                    advanced_result = {**result, "html": html, "psd_bytes": psd_bytes}
-                    zip_bytes = build_export_zip(advanced_result)
-                st.session_state[export_state_key] = {
-                    "html_bytes": html.encode("utf-8"),
-                    "psd_bytes": psd_bytes,
-                    "zip_bytes": zip_bytes,
-                }
-                st.rerun()
-        else:
-            st.success("高级导出文件已准备完成，可以继续下载。")
-
-
-def render_candidate_gallery(result: dict[str, Any]) -> None:
-    combos = result["combos"][:STREAMLIT_SAFE_TOP_N]
-    if not combos:
-        return
-    st.markdown("**参考模特图**")
-    ref_cols = st.columns(max(1, len(result["targets"])))
-    for idx, target in enumerate(result["targets"]):
-        with ref_cols[idx]:
-            st.image(
-                cv2.cvtColor(thumbnail_for_ui(target["image_bgr"], 170, 190), cv2.COLOR_BGR2RGB),
-                caption=target["label"],
-                use_container_width=False,
-            )
-    st.markdown("**最佳候选**")
-    cols = st.columns(max(1, len(combos)))
-    for idx, combo in enumerate(combos):
-        with cols[idx]:
-            st.image(
-                cv2.cvtColor(thumbnail_for_ui(combo["image"], 180, 230), cv2.COLOR_BGR2RGB),
-                caption=f"候选 {idx + 1}",
-                use_container_width=False,
-            )
-            st.caption(f"DeltaE {combo['de']:.2f}")
-
-
-def build_single_job_ui() -> None:
-    sample_names = available_sample_names()
-    has_local_samples = bool(sample_names)
-
-    top_cols = st.columns([1.1, 1.1, 1.0, 1.0])
-    source_options = ["本地样例", "手动上传"] if has_local_samples else ["手动上传"]
-    with top_cols[0]:
-        source_mode = st.radio("输入方式", source_options, horizontal=True, label_visibility="collapsed")
-
-    sample_name = "manual"
-    region_count = 1
-    orig_img = None
-    region_sources: list[dict[str, Any]] = []
-
-    if source_mode == "本地样例" and has_local_samples:
-        with top_cols[1]:
-            sample_name = st.selectbox("选择样例", sample_names, label_visibility="collapsed")
-        try:
-            sample = discover_sample_bundle(sample_name)
-        except FileNotFoundError:
-            st.warning("本地样例不存在，已自动切换为手动上传模式。")
-            source_mode = "手动上传"
-            sample = None
-        if sample is not None:
-            region_count = sample["region_count"]
-            orig_img = constrain_image_for_streamlit(sample["orig_img"])
-            region_sources = [
-                {"name": item["name"], "mask_source": constrain_image_for_streamlit(item["mask_source"])}
-                for item in sample["region_sources"]
-            ]
-
-    if source_mode == "手动上传" or not region_sources:
-        with top_cols[1]:
-            region_count = st.radio(
-                "区域数量",
-                [1, 2],
-                horizontal=True,
-                format_func=lambda value: "一件套" if value == 1 else "两件套",
-                label_visibility="collapsed",
-            )
-        orig_cols = st.columns(3 if region_count == 1 else 4)
-        with orig_cols[0]:
-            orig_file = st.file_uploader("原图", type=["jpg", "jpeg", "png"])
-        orig_img = load_uploaded_image(orig_file)
-        region_sources = []
-        if region_count == 1:
-            with orig_cols[1]:
-                mask_file = st.file_uploader("主体蒙版", type=["jpg", "jpeg", "png"], key="release_mask_one")
-            region_sources.append({"name": "主体", "mask_source": load_uploaded_image(mask_file)})
-        else:
-            with orig_cols[1]:
-                top_file = st.file_uploader("上衣蒙版", type=["jpg", "jpeg", "png"], key="release_mask_top")
-            with orig_cols[2]:
-                bottom_file = st.file_uploader("底裤蒙版", type=["jpg", "jpeg", "png"], key="release_mask_bottom")
-            region_sources.extend(
-                [
-                    {"name": "上衣", "mask_source": load_uploaded_image(top_file)},
-                    {"name": "底裤", "mask_source": load_uploaded_image(bottom_file)},
-                ]
-            )
-
-    color_count = 1
-    if region_count != 1:
-        with top_cols[2]:
-            color_count = st.radio(
-                "调色数量",
-                [1, 2],
-                horizontal=True,
-                format_func=lambda value: "同一颜色" if value == 1 else "两个颜色",
-                label_visibility="collapsed",
-            )
-
-    ref_paths = list_reference_paths() if source_mode == "本地样例" else []
-    ref_name_map = {path.name: path for path in ref_paths}
-    ref_name_options = list(ref_name_map.keys())
-    ref_inputs: list[dict[str, Any]] = []
-    ref_cols = st.columns(max(color_count, 1))
-
-    for idx in range(color_count):
-        label_default = f"颜色 {idx + 1}"
-        with ref_cols[idx]:
-            st.markdown(f"**{label_default}**")
-            if source_mode == "本地样例" and ref_name_options:
-                default_index = min(idx, len(ref_name_options) - 1)
-                validation_name = st.selectbox(
-                    f"{label_default} 校验图",
-                    ref_name_options,
-                    index=default_index,
-                    key=f"release_validation_ref_{idx}",
-                )
-                validation_path = ref_name_map[validation_name]
-                validation_image = constrain_image_for_streamlit(read_image_path(validation_path))
-                label = validation_path.stem
-            else:
-                validation_file = st.file_uploader(
-                    f"{label_default} 校验图",
-                    type=["jpg", "jpeg", "png"],
-                    key=f"release_validation_upload_{idx}",
-                )
-                validation_image = load_uploaded_image(validation_file)
-                label = Path(validation_file.name).stem if validation_file is not None else label_default
-
-            render_file = st.file_uploader(
-                f"{label_default} 色块图",
-                type=["jpg", "jpeg", "png"],
-                key=f"release_render_upload_{idx}",
-            )
-            render_image = load_uploaded_image(render_file)
-            ref_inputs.append({"label": label, "validation_image": validation_image, "render_image": render_image})
-
-    region_map = [0] if region_count == 1 else ([0, 0] if color_count == 1 else [0, 1])
-
-    action_cols = st.columns([3, 1])
-    with action_cols[0]:
-        generate_clicked = st.button("开始调色（发布版）", use_container_width=True)
-    with action_cols[1]:
-        if st.button("清空结果", use_container_width=True):
-            st.session_state.pop(RESULT_STATE_KEY, None)
-            for key in list(st.session_state.keys()):
-                if key.startswith("release_advanced_exports::"):
-                    st.session_state.pop(key, None)
-            st.rerun()
-
-    if generate_clicked:
-        if orig_img is None:
-            st.error("请先提供原图。")
-            return
-        if any(item["mask_source"] is None for item in region_sources):
-            st.error("请先提供所有区域的蒙版或对齐白底图。")
-            return
-        if any(item["validation_image"] is None for item in ref_inputs):
-            st.error("请先提供每个颜色的带模特校验图。")
-            return
-        with st.spinner("正在生成候选结果..."):
-            result = build_job_inputs(
-                "手动调色任务" if source_mode == "手动上传" else f"{sample_name}_调色任务",
-                orig_img,
-                region_sources,
-                ref_inputs,
-                region_map,
-                top_n=STREAMLIT_SAFE_TOP_N,
-            )
-        st.session_state[RESULT_STATE_KEY] = result
-
-    result = st.session_state.get(RESULT_STATE_KEY)
-    if result and result.get("combos"):
-        st.success(f"已完成，共生成 {len(result['combos'])} 组候选结果。")
-        render_result_downloads(result)
-        render_candidate_gallery(result)
-
-
-def main() -> None:
-    st.set_page_config(page_title="智能泳衣调色工具 - 发布版", layout="wide")
-    inject_css()
-    st.title("智能泳衣调色工具 - 发布版")
-    st.caption("这个入口专门用于线上发布：保留最近一次调色结果，并让高级导出在下载后继续可用。")
-    build_single_job_ui()
-
-
 if __name__ == "__main__":
     main()
-
