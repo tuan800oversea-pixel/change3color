@@ -99,6 +99,21 @@ def create_low_res_proxy(img: np.ndarray | None, max_width: int = 900) -> np.nda
     return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
 
+def thumbnail_for_ui(img: np.ndarray | None, max_width: int = 240, max_height: int = 320) -> np.ndarray:
+    if img is None:
+        raise ValueError("无法为 None 图像生成缩略图")
+    view = ensure_bgr(img)
+    if view is None:
+        raise ValueError("图像为空，无法生成缩略图")
+    h, w = view.shape[:2]
+    scale = min(max_width / max(w, 1), max_height / max(h, 1), 1.0)
+    if scale >= 1.0:
+        return view
+    target_w = max(1, int(round(w * scale)))
+    target_h = max(1, int(round(h * scale)))
+    return cv2.resize(view, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+
 def largest_component(mask: np.ndarray) -> np.ndarray:
     binary = (mask > 0).astype(np.uint8)
     count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
