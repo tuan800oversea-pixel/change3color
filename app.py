@@ -3371,13 +3371,17 @@ def inject_css() -> None:
 def constrain_image_for_streamlit(img: np.ndarray | None, max_side: int = STREAMLIT_SAFE_MAX_SIDE) -> np.ndarray | None:
     if img is None:
         return None
-    bgr = ensure_bgr(img)
-    h, w = bgr.shape[:2]
+    kept = np.asarray(img).copy()
+    h, w = kept.shape[:2]
     longest = max(h, w)
     if longest <= max_side:
-        return bgr
+        return kept
     scale = max_side / float(longest)
-    return cv2.resize(bgr, (max(1, int(round(w * scale))), max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
+    return cv2.resize(
+        kept,
+        (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+        interpolation=cv2.INTER_AREA,
+    )
 
 
 def load_uploaded_image(uploaded_file: Any) -> np.ndarray | None:
