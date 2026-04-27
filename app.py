@@ -34,6 +34,27 @@ class ColorSpec:
     css: str
 
 
+def inject_css() -> None:
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            padding-top: 1.2rem;
+            padding-bottom: 2rem;
+            max-width: 1380px;
+        }
+        .stButton > button, .stDownloadButton > button {
+            border-radius: 14px;
+        }
+        img {
+            border-radius: 14px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def slugify(value: str) -> str:
     cleaned = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", value, flags=re.UNICODE)
     return cleaned.strip("_") or "result"
